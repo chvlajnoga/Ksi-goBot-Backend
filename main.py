@@ -20,6 +20,7 @@ SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── SUPABASE ──
 def sb_headers():
     return {
         "apikey": SUPABASE_SECRET,
@@ -41,6 +42,15 @@ async def sb_select(table: str, filters: str = ""):
         r = await c.get(url, headers=sb_headers(), timeout=10)
     return r.json() if r.status_code == 200 else []
 
+async def sb_upsert(table: str, data: dict, on_conflict: str):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = {**sb_headers(), "Prefer": f"resolution=merge-duplicates,return=representation"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url + f"?on_conflict={on_conflict}",
+                         headers=headers, json=data, timeout=15)
+    return r
+
+# ── MODELE ──
 class ImapConfig(BaseModel):
     host: str
     port: int = 993
@@ -58,6 +68,17 @@ class ChatRequest(BaseModel):
     client_email: Optional[str] = ""
     invoices: list = []
 
+# ── KATEGORIE EMAILI ──
+EMAIL_CATEGORIES = {
+    "faktura":    {"label": "Faktura",             "color": "#c9a84c", "icon": "🧾"},
+    "zapytanie":  {"label": "Zapytanie ofertowe",  "color": "#4a8fe8", "icon": "❓"},
+    "zamowienie": {"label": "Zamówienie",           "color": "#2eb87a", "icon": "📦"},
+    "platnosc":   {"label": "Potwierdzenie płatności", "color": "#8a6be8", "icon": "💳"},
+    "spam":       {"label": "Spam / Nieistotne",   "color": "#5a5752", "icon": "🗑️"},
+    "inne":       {"label": "Inne",                "color": "#5a5752", "icon": "📧"},
+}
+
+# ── ENDPOINTS ──
 @app.get("/")
 @app.get("/health")
 def health():
@@ -70,79 +91,114 @@ def test_imap(config: ImapConfig):
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
                else imaplib.IMAP4(config.host, config.port)
         mail.login(config.username, config.password)
+        # Pobierz listę folderów
+        _, folders_raw = mail.list()
+        folders = []
+        for f in folders_raw:
+            try:
+                parts = f.decode().split('"/"')
+                if parts:
+                    folders.append(parts[-1].strip().strip('"'))
+            except: pass
         mail.logout()
-        return {"success": True, "message": "Połączenie udane.", "email": config.username}
+        return {"success": True, "message": f"Połączenie udane.",
+                "email": config.username, "folders": folders[:10]}
     except imaplib.IMAP4.error as e:
         raise HTTPException(status_code=401, detail=f"Błąd logowania: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd: {str(e)}")
-        @app.post("/api/scan")
+
+@app.post("/api/scan")
 async def scan_mailbox(req: ScanRequest):
     config = req.imap
     results = {"faktury": [], "zapytania": [], "zamowienia": [],
                "platnosci": [], "spam": [], "inne": []}
     errors = []
+
     print(f"[SCAN] Start: {config.username}")
+
     try:
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
                else imaplib.IMAP4(config.host, config.port)
         mail.login(config.username, config.password)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
+
     try:
         mail.select(config.folder)
         since = (datetime.now() - timedelta(days=config.days_back)).strftime("%d-%b-%Y")
         _, ids_raw = mail.search(None, f'(SINCE "{since}")')
-        ids = ids_raw[0].split()[-100:]
-        print(f"[SCAN] Emaili: {len(ids)}")
+        ids = ids_raw[0].split()[-100:]  # max 100 emaili
+        print(f"[SCAN] Emaili do analizy: {len(ids)}")
+
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
         for msg_id in ids:
             try:
                 _, msg_data = mail.fetch(msg_id, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
+
                 subject = _decode_hdr(msg.get("Subject", ""))
                 sender  = msg.get("From", "")
                 date    = msg.get("Date", "")
                 body    = _get_body(msg)
                 atts    = _get_attachments(msg)
-                classification = _classify_email(claude, subject, sender, body, atts, date)
+
+                print(f"[SCAN] Klasyfikuję: {subject[:60]}")
+
+                # KLASYFIKACJA przez Claude
+                classification = _classify_email(
+                    claude, subject, sender, body, atts, date
+                )
                 category = classification.get("category", "inne")
-                print(f"[SCAN] {category}: {subject[:50]}")
+                print(f"[SCAN] → {category}: {subject[:40]}")
+
+                # Zbuduj rekord emaila
                 email_record = {
                     "client_email":   config.username,
                     "category":       category,
                     "sender":         str(sender)[:255],
                     "subject":        str(subject)[:500],
+                    "date":           _to_date(date),
                     "summary":        str(classification.get("summary", ""))[:1000],
-                    "priority":       str(classification.get("priority", "normalny"))[:20],
+                    "priority":       str(classification.get("priority", "normal"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
                     "action_desc":    str(classification.get("action_desc", ""))[:500],
                     "has_attachment": len(atts) > 0,
                     "status":         "nowe",
                 }
-                d = _to_date(date)
-                if d: email_record["date"] = d
-                await sb_insert("emails", email_record)
+
+                # Zapisz email do bazy
+                email_result = await sb_insert("emails", email_record)
+
+                # Jeśli to FAKTURA — analizuj głębiej
                 if category == "faktura" and atts:
                     for att in atts:
-                        if att["content_type"] in ("application/pdf","image/jpeg","image/png"):
+                        if att["content_type"] == "application/pdf" or \
+                           att["content_type"].startswith("image/"):
                             inv = _analyze_invoice(claude, att, sender, subject)
                             if inv:
-                                db = _prepare_invoice_db(inv, config.username, sender, subject, att["filename"])
+                                db = _prepare_invoice_db(inv, config.username,
+                                                          sender, subject,
+                                                          att["filename"])
                                 await sb_insert("invoices", db)
                                 results["faktury"].append(inv)
+
+                # Jeśli to ZAPYTANIE — zapisz do osobnej tabeli
                 elif category == "zapytanie":
-                    inq = {
-                        "client_email":       config.username,
-                        "sender":             str(sender)[:255],
-                        "subject":            str(subject)[:500],
-                        "summary":            str(classification.get("summary",""))[:1000],
-                        "suggested_response": str(classification.get("suggested_response",""))[:2000],
-                        "status":             "nowe",
+                    inquiry = {
+                        "client_email": config.username,
+                        "sender":       str(sender)[:255],
+                        "subject":      str(subject)[:500],
+                        "date":         _to_date(date),
+                        "summary":      str(classification.get("summary", ""))[:1000],
+                        "suggested_response": str(
+                            classification.get("suggested_response", ""))[:2000],
+                        "status":       "nowe",
                     }
-                    if d: inq["date"] = d
-                    await sb_insert("inquiries", inq)
-                    results["zapytania"].append(inq)
+                    await sb_insert("inquiries", inquiry)
+                    results["zapytania"].append(inquiry)
+
                 elif category == "zamowienie":
                     results["zamowienia"].append({"subject": subject, "sender": sender})
                 elif category == "platnosc":
@@ -151,29 +207,47 @@ async def scan_mailbox(req: ScanRequest):
                     results["spam"].append({"subject": subject})
                 else:
                     results["inne"].append({"subject": subject, "sender": sender})
+
             except Exception as e:
-                print(f"[SCAN] Błąd: {e}")
+                print(f"[SCAN] Błąd emaila: {e}")
                 errors.append(str(e))
+
         mail.logout()
+
+        # Log skanowania
+        total = sum(len(v) for v in results.values())
         await sb_insert("scan_logs", {
-            "client_email": config.username,
+            "client_email":   config.username,
             "scanned_emails": len(ids),
             "invoices_found": len(results["faktury"]),
-            "status": "ok",
-            "message": f"Emaili:{len(ids)} Faktury:{len(results['faktury'])} Zapytania:{len(results['zapytania'])}"
+            "status":         "ok",
+            "message":        f"Emaili: {len(ids)} | "
+                              f"Faktury: {len(results['faktury'])} | "
+                              f"Zapytania: {len(results['zapytania'])} | "
+                              f"Zamówienia: {len(results['zamowienia'])} | "
+                              f"Inne: {len(results['inne'])}"
         })
+
     except Exception as e:
         try: mail.logout()
         except: pass
         raise HTTPException(status_code=500, detail=str(e))
-    return {"success": True, "scanned_emails": len(ids),
-            "results": {k: len(v) for k,v in results.items()},
-            "details": results, "errors": errors,
-            "scanned_at": datetime.now().isoformat()}
-    @app.get("/api/emails/{client_email:path}")
+
+    print(f"[SCAN] Gotowe: {json.dumps({k: len(v) for k,v in results.items()})}")
+    return {
+        "success":        True,
+        "scanned_emails": len(ids),
+        "results":        {k: len(v) for k, v in results.items()},
+        "details":        results,
+        "errors":         errors,
+        "scanned_at":     datetime.now().isoformat(),
+    }
+
+@app.get("/api/emails/{client_email:path}")
 async def get_emails(client_email: str, category: str = ""):
     filters = f"client_email=eq.{client_email}"
-    if category: filters += f"&category=eq.{category}"
+    if category:
+        filters += f"&category=eq.{category}"
     data = await sb_select("emails", filters)
     return {"success": True, "emails": data, "count": len(data)}
 
@@ -193,34 +267,51 @@ async def chat(req: ChatRequest):
     invoices = req.invoices
     if not invoices and req.client_email:
         try:
-            data = await sb_select("invoices", f"client_email=eq.{req.client_email}")
+            data = await sb_select("invoices",
+                                   f"client_email=eq.{req.client_email}")
             invoices = data if isinstance(data, list) else []
         except: pass
-    ctx = f"Faktury: {json.dumps(invoices, ensure_ascii=False)}" if invoices else "Brak faktur."
-    r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=800,
-        messages=[{"role":"user","content":f"Jesteś asystentem księgowym. Odpowiadaj po polsku.\n{ctx}\n\nPytanie: {req.question}"}])
+    ctx = f"Faktury: {json.dumps(invoices, ensure_ascii=False)}" \
+          if invoices else "Brak faktur."
+    r = claude.messages.create(
+        model="claude-sonnet-4-6", max_tokens=800,
+        messages=[{"role": "user", "content":
+                   f"Jesteś asystentem księgowym. Odpowiadaj po polsku.\n"
+                   f"{ctx}\n\nPytanie: {req.question}"}])
     return {"success": True, "answer": r.content[0].text}
-    def _decode_hdr(val):
+
+# ── HELPERS ──
+def _decode_hdr(val):
     try:
         parts = decode_header(val)
-        return "".join(p.decode(c or "utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p,c in parts)
-    except: return str(val)
+        return "".join(
+            p.decode(c or "utf-8", errors="replace")
+            if isinstance(p, bytes) else str(p)
+            for p, c in parts)
+    except:
+        return str(val)
 
 def _get_body(msg) -> str:
+    """Wyciąga tekst z emaila (plain text lub HTML)."""
     body = ""
     try:
         for part in msg.walk():
-            if part.get_content_type() == "text/plain":
+            ct = part.get_content_type()
+            if ct == "text/plain":
                 payload = part.get_payload(decode=True)
                 if payload:
-                    body = payload.decode("utf-8", errors="replace")[:2000]
+                    body += payload.decode("utf-8", errors="replace")[:2000]
                     break
         if not body:
             for part in msg.walk():
-                if part.get_content_type() == "text/html":
+                ct = part.get_content_type()
+                if ct == "text/html":
                     payload = part.get_payload(decode=True)
                     if payload:
-                        body = re.sub(r"<[^>]+>", " ", payload.decode("utf-8", errors="replace"))[:2000]
+                        text = payload.decode("utf-8", errors="replace")
+                        # Usuń tagi HTML
+                        text = re.sub(r"<[^>]+>", " ", text)
+                        body = text[:2000]
                         break
     except: pass
     return body[:1500]
@@ -229,66 +320,107 @@ def _get_attachments(msg):
     result = []
     for part in msg.walk():
         ct = part.get_content_type()
-        cd = str(part.get("Content-Disposition",""))
-        if ct in ("application/pdf","image/jpeg","image/png","image/jpg") and "attachment" in cd:
+        cd = str(part.get("Content-Disposition", ""))
+        if ct in ("application/pdf", "image/jpeg", "image/png", "image/jpg") \
+           and "attachment" in cd:
             try:
                 content = part.get_payload(decode=True)
                 if content and len(content) > 100:
-                    result.append({"filename": _decode_hdr(part.get_filename() or "file"), "content": content, "content_type": ct})
+                    result.append({
+                        "filename":     _decode_hdr(part.get_filename() or "file"),
+                        "content":      content,
+                        "content_type": ct,
+                    })
             except: pass
     return result
 
 def _classify_email(claude, subject, sender, body, atts, date) -> dict:
+    """Klasyfikuje email do jednej z kategorii."""
     has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
     prompt = f"""Przeanalizuj email i zwróć TYLKO JSON bez markdown:
-{{"category":"faktura|zapytanie|zamowienie|platnosc|spam|inne","priority":"wysoki|normalny|niski","summary":"1-2 zdania","action_needed":true/false,"action_desc":"co zrobić lub null","suggested_response":"propozycja odpowiedzi jeśli zapytanie lub null"}}
-Kategorie: faktura=faktura VAT/rachunek, zapytanie=pytanie o cenę/ofertę, zamowienie=składanie zamówienia, platnosc=potwierdzenie przelewu, spam=reklama/newsletter, inne=reszta
-Od: {sender} | Temat: {subject} | PDF: {has_pdf} | Treść: {body[:600]}"""
+
+{{
+  "category": "faktura|zapytanie|zamowienie|platnosc|spam|inne",
+  "priority": "wysoki|normalny|niski",
+  "summary": "1-2 zdania co zawiera email",
+  "action_needed": true/false,
+  "action_desc": "co należy zrobić lub null",
+  "suggested_response": "propozycja odpowiedzi jeśli to zapytanie lub null"
+}}
+
+Definicje kategorii:
+- faktura: faktura VAT, rachunek, paragon, potwierdzenie zakupu z kwotą
+- zapytanie: klient lub kontrahent pyta o cenę, ofertę, współpracę, dostępność
+- zamowienie: ktoś składa zamówienie na produkt lub usługę
+- platnosc: potwierdzenie przelewu, wpłaty, rozliczenia
+- spam: reklama, newsletter, nieistotne powiadomienie
+- inne: wszystko inne
+
+Email:
+Od: {sender}
+Temat: {subject}
+Data: {date}
+Ma załącznik PDF: {has_pdf}
+Treść: {body[:800]}"""
+
     try:
-        r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=400,
-            messages=[{"role":"user","content":prompt}])
-        return json.loads(r.content[0].text.replace("```json","").replace("```","").strip())
+        r = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=400,
+            messages=[{"role": "user", "content": prompt}])
+        raw = r.content[0].text.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
     except Exception as e:
         print(f"[AI] Błąd klasyfikacji: {e}")
-        return {"category":"inne","priority":"normalny","summary":subject,"action_needed":False}
+        return {"category": "inne", "priority": "normalny",
+                "summary": subject, "action_needed": False}
 
-def _analyze_invoice(claude, att, sender, subject):
+def _analyze_invoice(claude, att, sender, subject) -> Optional[dict]:
+    """Analizuje PDF faktury i wyciąga dane."""
     try:
         b64 = base64.standard_b64encode(att["content"]).decode()
-        ct = att["content_type"]
-        mt = "image/jpeg" if ct == "image/jpg" else ct
-        blk = {"type":"document","source":{"type":"base64","media_type":mt,"data":b64}} if ct=="application/pdf" \
-         else {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}}
+        ct  = att["content_type"]
+        mt  = "image/jpeg" if ct == "image/jpg" else ct
+        blk = {"type": "document",
+               "source": {"type": "base64", "media_type": mt, "data": b64}} \
+              if ct == "application/pdf" \
+              else {"type": "image",
+                    "source": {"type": "base64", "media_type": mt, "data": b64}}
         prompt = f"""Przeanalizuj fakturę. Zwróć TYLKO JSON bez markdown:
-{{"vendor":"nazwa","invoice_number":"numer","date":"YYYY-MM-DD","due_date":"YYYY-MM-DD","amount_net":0,"amount_gross":0,"vat":0,"vat_rate":23,"category":"IT/Marketing/Biuro/Uslugi/Inne","description":"opis","currency":"PLN","is_cost_deductible":true,"confidence":"high/medium/low"}}
+{{"vendor":"nazwa","invoice_number":"numer","date":"YYYY-MM-DD","due_date":"YYYY-MM-DD",
+"amount_net":0,"amount_gross":0,"vat":0,"vat_rate":23,
+"category":"IT/Marketing/Biuro/Uslugi/Inne",
+"description":"opis","currency":"PLN","is_cost_deductible":true,"confidence":"high/medium/low"}}
 Od: {sender} | Temat: {subject} | Plik: {att['filename']}"""
-        r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=500,
-            messages=[{"role":"user","content":[blk,{"type":"text","text":prompt}]}])
-        data = json.loads(r.content[0].text.replace("```json","").replace("```","").strip())
+        r = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=500,
+            messages=[{"role": "user",
+                        "content": [blk, {"type": "text", "text": prompt}]}])
+        data = json.loads(
+            r.content[0].text.replace("```json", "").replace("```", "").strip())
         data["source_email"] = sender
-        data["filename"] = att["filename"]
+        data["filename"]     = att["filename"]
         return data
     except Exception as e:
-        print(f"[AI] Błąd faktury: {e}")
+        print(f"[AI] Błąd analizy faktury: {e}")
         return None
 
 def _prepare_invoice_db(inv, client_email, sender, subject, filename) -> dict:
     db = {
-        "client_email": client_email,
-        "vendor": str(inv.get("vendor") or "")[:255],
-        "amount_net": _to_float(inv.get("amount_net")),
-        "amount_gross": _to_float(inv.get("amount_gross")),
-        "vat": _to_float(inv.get("vat")),
-        "vat_rate": _to_float(inv.get("vat_rate")),
-        "category": str(inv.get("category") or "Inne")[:50],
-        "description": str(inv.get("description") or "")[:500],
-        "currency": str(inv.get("currency") or "PLN")[:10],
+        "client_email":       client_email,
+        "vendor":             str(inv.get("vendor") or "")[:255],
+        "amount_net":         _to_float(inv.get("amount_net")),
+        "amount_gross":       _to_float(inv.get("amount_gross")),
+        "vat":                _to_float(inv.get("vat")),
+        "vat_rate":           _to_float(inv.get("vat_rate")),
+        "category":           str(inv.get("category") or "Inne")[:50],
+        "description":        str(inv.get("description") or "")[:500],
+        "currency":           str(inv.get("currency") or "PLN")[:10],
         "is_cost_deductible": bool(inv.get("is_cost_deductible", False)),
-        "confidence": str(inv.get("confidence") or "medium")[:20],
-        "source_email": str(sender)[:255],
-        "source_subject": str(subject)[:500],
-        "filename": str(filename)[:255],
-        "status": "ok",
+        "confidence":         str(inv.get("confidence") or "medium")[:20],
+        "source_email":       str(sender)[:255],
+        "source_subject":     str(subject)[:500],
+        "filename":           str(filename)[:255],
+        "status":             "ok",
     }
     inv_num = str(inv.get("invoice_number") or "")[:100]
     if inv_num: db["invoice_number"] = inv_num
