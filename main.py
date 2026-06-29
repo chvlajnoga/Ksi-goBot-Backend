@@ -209,6 +209,18 @@ async def scan_mailbox(req: ScanRequest):
                 # Zapisz email do bazy
                 email_result = await sb_insert("emails", email_record)
 
+                # KRYTYCZNE: jeśli email już istnieje (409 conflict z unique index),
+                # to NIE przetwarzaj go dalej — to duplikat który prześlizgnął się
+                # przez wcześniejsze sprawdzenie (np. race condition lub cache)
+                if email_result.status_code == 409:
+                    print(f"[SCAN] Email odrzucony jako duplikat przez baze (409): {subject[:50]}")
+                    skipped_duplicates += 1
+                    continue
+                elif email_result.status_code not in (200, 201):
+                    print(f"[SCAN] Nieoczekiwany blad zapisu emaila ({email_result.status_code}): {subject[:50]}")
+                    errors.append(f"Email nie zapisany: {subject[:50]}")
+                    continue
+
                 # Jeśli to FAKTURA — analizuj głębiej
                 if category == "faktura" and atts:
                     for att in atts:
