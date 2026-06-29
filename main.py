@@ -42,6 +42,19 @@ async def sb_select(table: str, filters: str = ""):
         r = await c.get(url, headers=sb_headers(), timeout=10)
     return r.json() if r.status_code == 200 else []
 
+async def sb_exists(table: str, filters: str) -> bool:
+    """Sprawdza czy rekord już istnieje w bazie."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}&limit=1"
+    headers = {**sb_headers(), "Prefer": "count=exact"}
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=headers, timeout=10)
+    try:
+        count = int(r.headers.get("content-range", "0/0").split("/")[-1])
+        return count > 0
+    except:
+        data = r.json()
+        return isinstance(data, list) and len(data) > 0
+
 async def sb_upsert(table: str, data: dict, on_conflict: str):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {**sb_headers(), "Prefer": f"resolution=merge-duplicates,return=representation"}
@@ -132,6 +145,7 @@ async def scan_mailbox(req: ScanRequest):
         print(f"[SCAN] Emaili do analizy: {len(ids)}")
 
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        skipped_duplicates = 0
 
         for msg_id in ids:
             try:
@@ -144,7 +158,26 @@ async def scan_mailbox(req: ScanRequest):
                 body    = _get_body(msg)
                 atts    = _get_attachments(msg)
 
-                print(f"[SCAN] Klasyfikuję: {subject[:60]}")
+                # Pobierz Message-ID — unikalny identyfikator emaila
+                message_id = _clean_message_id(msg.get("Message-ID", "") or msg.get("Message-Id", ""))
+                if not message_id:
+                    # Fallback: hash z tematu + daty + nadawcy
+                    import hashlib
+                    raw = f"{sender}{subject}{date}"
+                    message_id = "hash-" + hashlib.md5(raw.encode()).hexdigest()
+
+                print(f"[SCAN] Klasyfikuję: {subject[:60]} [{message_id[:30]}]")
+
+                # SPRAWDŹ DUPLIKAT po Message-ID
+                already_exists = await sb_exists(
+                    "emails",
+                    f"client_email=eq.{config.username}&message_id=eq.{message_id}"
+                )
+                if already_exists:
+                    print(f"[SCAN] Pominięto duplikat (Message-ID): {subject[:50]}")
+                    skipped_duplicates += 1
+                    continue
+                sender_clean = sender[:200]
 
                 # KLASYFIKACJA przez Claude
                 classification = _classify_email(
@@ -181,6 +214,7 @@ async def scan_mailbox(req: ScanRequest):
                                 db = _prepare_invoice_db(inv, config.username,
                                                           sender, subject,
                                                           att["filename"])
+                                db["message_id"] = message_id[:500]
                                 await sb_insert("invoices", db)
                                 results["faktury"].append(inv)
 
@@ -233,14 +267,19 @@ async def scan_mailbox(req: ScanRequest):
         except: pass
         raise HTTPException(status_code=500, detail=str(e))
 
-    print(f"[SCAN] Gotowe: {json.dumps({k: len(v) for k,v in results.items()})}")
+    total_new = sum(len(v) for v in results.values())
+    print(f"[SCAN] Gotowe: nowe={total_new}, duplikaty={skipped_duplicates}")
+    notification = "Brak nowych wiadomości na skrzynce." if total_new == 0 else f"Znaleziono {total_new} nowych emaili."
     return {
-        "success":        True,
-        "scanned_emails": len(ids),
-        "results":        {k: len(v) for k, v in results.items()},
-        "details":        results,
-        "errors":         errors,
-        "scanned_at":     datetime.now().isoformat(),
+        "success":            True,
+        "scanned_emails":     len(ids),
+        "new_emails":         total_new,
+        "skipped_duplicates": skipped_duplicates,
+        "results":            {k: len(v) for k, v in results.items()},
+        "details":            results,
+        "errors":             errors,
+        "notification":       notification,
+        "scanned_at":         datetime.now().isoformat(),
     }
 
 @app.get("/api/emails/{client_email:path}")
@@ -429,6 +468,10 @@ def _prepare_invoice_db(inv, client_email, sender, subject, filename) -> dict:
     dd = _to_date(inv.get("due_date"))
     if dd: db["due_date"] = dd
     return db
+
+def _clean_message_id(val: str) -> str:
+    """Czyści Message-ID emaila — usuwa nawiasy trójkątne i białe znaki."""
+    return val.strip().strip("<>").strip()[:500] if val else ""
 
 def _to_float(val):
     try: return float(val) if val is not None else 0.0
