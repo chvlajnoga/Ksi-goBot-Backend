@@ -1,39 +1,24 @@
 """
-KsięgoBot Backend — FastAPI + IMAP + Claude AI + Supabase
+KsięgoBot Backend v2.1 — FastAPI + IMAP + Claude AI + Supabase
 """
-
-import imaplib
-import email
-import base64
-import os
-import json
+import imaplib, email, base64, os, json, re
 from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional
 
-import anthropic
-import httpx
+import anthropic, httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ── APP ──
-app = FastAPI(title="KsięgoBot API", version="2.0.0")
+app = FastAPI(title="KsięgoBot API", version="2.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY", "")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# ── CONFIG ──
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "https://elfibvwjskmíaugxjckf.supabase.co")
-SUPABASE_SECRET  = os.environ.get("SUPABASE_SECRET_KEY", "")
-ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# ── SUPABASE HELPER ──
+# ── SUPABASE ──
 def sb_headers():
     return {
         "apikey": SUPABASE_SECRET,
@@ -43,32 +28,19 @@ def sb_headers():
     }
 
 async def sb_insert(table: str, data: dict):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    print(f"[DB] POST {url}")
+    print(f"[DB] Data: {json.dumps(data, ensure_ascii=False)[:400]}")
     async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/{table}",
-            headers=sb_headers(),
-            json=data,
-            timeout=10,
-        )
-        return r.json()
+        r = await client.post(url, headers=sb_headers(), json=data, timeout=15)
+    print(f"[DB] Status: {r.status_code} | Response: {r.text[:300]}")
+    return r
 
 async def sb_select(table: str, filters: str = ""):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}&order=created_at.desc"
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/{table}?{filters}&order=created_at.desc",
-            headers=sb_headers(),
-            timeout=10,
-        )
-        return r.json()
-
-async def sb_delete(table: str, filters: str):
-    async with httpx.AsyncClient() as client:
-        r = await client.delete(
-            f"{SUPABASE_URL}/rest/v1/{table}?{filters}",
-            headers=sb_headers(),
-            timeout=10,
-        )
-        return r.status_code
+        r = await client.get(url, headers=sb_headers(), timeout=10)
+    return r.json()
 
 # ── MODELE ──
 class ImapConfig(BaseModel):
@@ -83,277 +55,195 @@ class ImapConfig(BaseModel):
 
 class ScanRequest(BaseModel):
     imap: ImapConfig
-    client_email: Optional[str] = ""
 
 class ChatRequest(BaseModel):
     question: str
     client_email: Optional[str] = ""
     invoices: list = []
 
-# ─────────────────────────────────────────────
-# SETUP — Utwórz tabele w Supabase (wywołaj raz)
-# ─────────────────────────────────────────────
-@app.post("/api/setup-db")
-async def setup_db():
-    """
-    Tworzy tabele w Supabase przez SQL Editor.
-    Wywołaj raz po podpięciu bazy.
-    """
-    sql = """
-    CREATE TABLE IF NOT EXISTS invoices (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        client_email TEXT NOT NULL,
-        vendor TEXT,
-        invoice_number TEXT,
-        date DATE,
-        due_date DATE,
-        amount_net NUMERIC(12,2) DEFAULT 0,
-        amount_gross NUMERIC(12,2) DEFAULT 0,
-        vat NUMERIC(12,2) DEFAULT 0,
-        vat_rate NUMERIC(5,2),
-        category TEXT DEFAULT 'Inne',
-        description TEXT,
-        currency TEXT DEFAULT 'PLN',
-        is_cost_deductible BOOLEAN DEFAULT false,
-        confidence TEXT DEFAULT 'medium',
-        source_email TEXT,
-        source_subject TEXT,
-        filename TEXT,
-        status TEXT DEFAULT 'ok',
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+# ── ENDPOINTS ──
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "supabase_url": SUPABASE_URL[:40] + "..." if SUPABASE_URL else "NOT SET"}
 
-    CREATE TABLE IF NOT EXISTS imap_configs (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        client_email TEXT UNIQUE NOT NULL,
-        imap_host TEXT NOT NULL,
-        imap_port INTEGER DEFAULT 993,
-        use_ssl BOOLEAN DEFAULT true,
-        folder TEXT DEFAULT 'INBOX',
-        last_scan TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS scan_logs (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        client_email TEXT NOT NULL,
-        scanned_emails INTEGER DEFAULT 0,
-        invoices_found INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'ok',
-        message TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    """
-    return {
-        "success": True,
-        "message": "Uruchom poniższy SQL w Supabase SQL Editor (Database → SQL Editor)",
-        "sql": sql
-    }
-
-# ─────────────────────────────────────────────
-# IMAP TEST
-# ─────────────────────────────────────────────
 @app.post("/api/imap/test")
 def test_imap(config: ImapConfig):
     try:
-        if config.use_ssl:
-            mail = imaplib.IMAP4_SSL(config.host, config.port)
-        else:
-            mail = imaplib.IMAP4(config.host, config.port)
+        mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl else imaplib.IMAP4(config.host, config.port)
         mail.login(config.username, config.password)
         mail.logout()
-        return {"success": True, "message": f"Połączenie z {config.host} udane.", "email": config.username}
+        return {"success": True, "message": f"Polaczenie z {config.host} udane.", "email": config.username}
     except imaplib.IMAP4.error as e:
-        raise HTTPException(status_code=401, detail=f"Błąd logowania: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Blad logowania: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd połączenia: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Blad polaczenia: {str(e)}")
 
-# ─────────────────────────────────────────────
-# SCAN — Skanuj skrzynkę i zapisz do Supabase
-# ─────────────────────────────────────────────
 @app.post("/api/scan")
 async def scan_mailbox(req: ScanRequest):
     config = req.imap
-    invoices = []
-    errors = []
+    invoices, errors = [], []
 
-    # Połącz z IMAP
+    print(f"[SCAN] Start dla: {config.username}")
+    print(f"[SCAN] SUPABASE_URL = {SUPABASE_URL[:50] if SUPABASE_URL else 'BRAK!'}")
+
     try:
-        if config.use_ssl:
-            mail = imaplib.IMAP4_SSL(config.host, config.port)
-        else:
-            mail = imaplib.IMAP4(config.host, config.port)
+        mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl else imaplib.IMAP4(config.host, config.port)
         mail.login(config.username, config.password)
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Blad IMAP: {str(e)}")
 
     try:
         mail.select(config.folder)
-        since_date = (datetime.now() - timedelta(days=config.days_back)).strftime("%d-%b-%Y")
-        status, message_ids = mail.search(None, f'(SINCE "{since_date}")')
-        ids = message_ids[0].split()[-50:]
+        since = (datetime.now() - timedelta(days=config.days_back)).strftime("%d-%b-%Y")
+        _, ids_raw = mail.search(None, f'(SINCE "{since}")')
+        ids = ids_raw[0].split()[-50:]
+        print(f"[SCAN] Znaleziono emaili: {len(ids)}")
 
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
         for msg_id in ids:
             try:
-                status, msg_data = mail.fetch(msg_id, "(RFC822)")
-                if status != "OK":
-                    continue
+                _, msg_data = mail.fetch(msg_id, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
-                subject = _decode_header(msg.get("Subject", ""))
+                subject = _decode_hdr(msg.get("Subject", ""))
                 sender  = msg.get("From", "")
-                attachments = _get_attachments(msg)
-                if not attachments:
+                atts = _get_attachments(msg)
+                if not atts:
                     continue
-                for att in attachments:
-                    inv = _analyze_with_claude(claude, att, sender, subject)
-                    if inv:
+                print(f"[SCAN] Email z {len(atts)} zalacznikami od: {sender}")
+                for att in atts:
+                    inv = _analyze(claude, att, sender, subject)
+                    if not inv:
+                        continue
+                    # Przygotuj dane do zapisu
+                    db = {
+                        "client_email":       config.username,
+                        "vendor":             str(inv.get("vendor") or "")[:255],
+                        "invoice_number":     str(inv.get("invoice_number") or "")[:100] or None,
+                        "amount_net":         _to_float(inv.get("amount_net")),
+                        "amount_gross":       _to_float(inv.get("amount_gross")),
+                        "vat":                _to_float(inv.get("vat")),
+                        "vat_rate":           _to_float(inv.get("vat_rate")),
+                        "category":           str(inv.get("category") or "Inne")[:50],
+                        "description":        str(inv.get("description") or "")[:500],
+                        "currency":           str(inv.get("currency") or "PLN")[:10],
+                        "is_cost_deductible": bool(inv.get("is_cost_deductible", False)),
+                        "confidence":         str(inv.get("confidence") or "medium")[:20],
+                        "source_email":       str(sender)[:255],
+                        "source_subject":     str(subject)[:500],
+                        "filename":           str(att["filename"])[:255],
+                        "status":             "ok",
+                        "date":               _to_date(inv.get("date")),
+                        "due_date":           _to_date(inv.get("due_date")),
+                    }
+                    # Usuń None z dat (Supabase wymaga null nie "None")
+                    for k in ("date", "due_date", "invoice_number"):
+                        if db[k] is None:
+                            db.pop(k)
+
+                    print(f"[SCAN] Zapisuję: {db['vendor']} {db['amount_gross']} zl")
+                    result = await sb_insert("invoices", db)
+                    if result.status_code in (200, 201):
+                        print(f"[SCAN] Zapisano OK")
                         inv["client_email"] = config.username
-                        # Zapisz do Supabase
-                        try:
-                            await sb_insert("invoices", inv)
-                        except Exception as db_err:
-                            errors.append(f"DB błąd: {str(db_err)}")
                         invoices.append(inv)
+                    else:
+                        err = f"DB blad {result.status_code}: {result.text[:200]}"
+                        print(f"[SCAN] {err}")
+                        errors.append(err)
             except Exception as e:
+                print(f"[SCAN] Blad emaila: {e}")
                 errors.append(str(e))
 
         mail.logout()
 
-        # Zapisz log skanowania
+        # Log skanowania
         try:
             await sb_insert("scan_logs", {
                 "client_email": config.username,
                 "scanned_emails": len(ids),
                 "invoices_found": len(invoices),
                 "status": "ok",
-                "message": f"Skanowanie zakończone. Emaili: {len(ids)}, Faktur: {len(invoices)}"
+                "message": f"Emaili: {len(ids)}, Faktur: {len(invoices)}"
             })
-        except:
-            pass
+        except Exception as e:
+            print(f"[SCAN] Blad logu: {e}")
 
     except Exception as e:
         try: mail.logout()
         except: pass
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "success": True,
-        "scanned_emails": len(ids),
-        "invoices_found": len(invoices),
-        "invoices": invoices,
-        "errors": errors,
-        "scanned_at": datetime.now().isoformat(),
-    }
+    print(f"[SCAN] Gotowe. Faktur zapisanych: {len(invoices)}, Bledow: {len(errors)}")
+    return {"success": True, "scanned_emails": len(ids), "invoices_found": len(invoices), "invoices": invoices, "errors": errors}
 
-# ─────────────────────────────────────────────
-# GET — Pobierz faktury z Supabase
-# ─────────────────────────────────────────────
-@app.get("/api/invoices/{client_email}")
+@app.get("/api/invoices/{client_email:path}")
 async def get_invoices(client_email: str):
-    try:
-        data = await sb_select("invoices", f"client_email=eq.{client_email}")
-        return {"success": True, "invoices": data, "count": len(data)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    data = await sb_select("invoices", f"client_email=eq.{client_email}")
+    return {"success": True, "invoices": data, "count": len(data) if isinstance(data, list) else 0}
 
-# ─────────────────────────────────────────────
-# DELETE — Usuń fakturę
-# ─────────────────────────────────────────────
-@app.delete("/api/invoices/{invoice_id}")
-async def delete_invoice(invoice_id: str):
-    try:
-        await sb_delete("invoices", f"id=eq.{invoice_id}")
-        return {"success": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─────────────────────────────────────────────
-# CHAT
-# ─────────────────────────────────────────────
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-    # Pobierz faktury z bazy jeśli nie przesłano
     invoices = req.invoices
     if not invoices and req.client_email:
         try:
             data = await sb_select("invoices", f"client_email=eq.{req.client_email}")
-            invoices = data
-        except:
-            pass
+            invoices = data if isinstance(data, list) else []
+        except: pass
+    ctx = f"Faktury: {json.dumps(invoices, ensure_ascii=False)}" if invoices else "Brak faktur."
+    r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=800,
+        messages=[{"role":"user","content":f"Jestes asystentem ksiegowym. Odpowiadaj po polsku.\n{ctx}\n\nPytanie: {req.question}"}])
+    return {"success": True, "answer": r.content[0].text}
 
-    context = f"Dane faktur: {json.dumps(invoices, ensure_ascii=False)}" if invoices else "Brak faktur."
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=800,
-        messages=[{"role": "user", "content": f"Jesteś asystentem księgowym. Odpowiadaj po polsku.\n{context}\n\nPytanie: {req.question}"}]
-    )
-    return {"success": True, "answer": response.content[0].text}
-
-# ─────────────────────────────────────────────
-# HEALTH
-# ─────────────────────────────────────────────
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "KsięgoBot API", "version": "2.0.0"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-def _decode_header(val):
+# ── HELPERS ──
+def _decode_hdr(val):
     try:
         parts = decode_header(val)
-        return "".join(p.decode(c or "utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p, c in parts)
-    except:
-        return str(val)
+        return "".join(p.decode(c or "utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p,c in parts)
+    except: return str(val)
 
 def _get_attachments(msg):
     result = []
     for part in msg.walk():
         ct = part.get_content_type()
-        cd = str(part.get("Content-Disposition", ""))
-        if ct in ("application/pdf", "image/jpeg", "image/png", "image/jpg") and "attachment" in cd:
+        cd = str(part.get("Content-Disposition",""))
+        if ct in ("application/pdf","image/jpeg","image/png","image/jpg") and "attachment" in cd:
             try:
                 content = part.get_payload(decode=True)
                 if content and len(content) > 100:
-                    result.append({"filename": _decode_header(part.get_filename() or "file"), "content": content, "content_type": ct})
-            except:
-                pass
+                    result.append({"filename": _decode_hdr(part.get_filename() or "file"), "content": content, "content_type": ct})
+            except: pass
     return result
 
-def _analyze_with_claude(claude, att, sender, subject):
+def _to_float(val):
+    try: return float(val) if val is not None else 0.0
+    except: return 0.0
+
+def _to_date(val):
+    if not val: return None
+    s = str(val)
+    if re.match(r"\d{4}-\d{2}-\d{2}", s): return s[:10]
+    return None
+
+def _analyze(claude, att, sender, subject):
     try:
         b64 = base64.standard_b64encode(att["content"]).decode()
         ct  = att["content_type"]
-        media_type = ct if ct != "image/jpg" else "image/jpeg"
-        doc_block = {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": b64}} if ct == "application/pdf" \
-               else {"type": "image",    "source": {"type": "base64", "media_type": media_type, "data": b64}}
-
-        prompt = f"""Przeanalizuj ten dokument. Zwróć TYLKO JSON bez markdown:
-{{"vendor":"nazwa","invoice_number":"numer lub null","date":"YYYY-MM-DD lub null","due_date":"YYYY-MM-DD lub null",
-"amount_net":0,"amount_gross":0,"vat":0,"vat_rate":23,"category":"IT/Marketing/Biuro/Usługi/Inne",
-"description":"opis","currency":"PLN","is_cost_deductible":true,"confidence":"high/medium/low"}}
-Email od: {sender} | Temat: {subject} | Plik: {att['filename']}"""
-
-        r = claude.messages.create(
-            model="claude-sonnet-4-6", max_tokens=500,
-            messages=[{"role": "user", "content": [doc_block, {"type": "text", "text": prompt}]}]
-        )
+        mt  = "image/jpeg" if ct == "image/jpg" else ct
+        blk = {"type":"document","source":{"type":"base64","media_type":mt,"data":b64}} if ct=="application/pdf" \
+         else {"type":"image",   "source":{"type":"base64","media_type":mt,"data":b64}}
+        prompt = f"""Przeanalizuj ten dokument. Zwroc TYLKO JSON bez markdown:
+{{"vendor":"nazwa","invoice_number":"numer lub null","date":"YYYY-MM-DD lub null","due_date":"YYYY-MM-DD lub null","amount_net":0,"amount_gross":0,"vat":0,"vat_rate":23,"category":"IT/Marketing/Biuro/Uslugi/Inne","description":"opis","currency":"PLN","is_cost_deductible":true,"confidence":"high/medium/low"}}
+Od: {sender} | Temat: {subject} | Plik: {att['filename']}"""
+        r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=500,
+            messages=[{"role":"user","content":[blk,{"type":"text","text":prompt}]}])
         data = json.loads(r.content[0].text.replace("```json","").replace("```","").strip())
-        data["source_email"]   = sender
-        data["source_subject"] = subject
-        data["filename"]       = att["filename"]
-        data["status"]         = "ok"
+        data["source_email"] = sender
+        data["filename"] = att["filename"]
         return data
-    except:
+    except Exception as e:
+        print(f"[AI] Blad analizy: {e}")
         return {"vendor": sender.split("@")[0], "filename": att["filename"],
-                "source_email": sender, "amount_gross": 0, "vat": 0,
-                "category": "Inne", "status": "error"}
+                "source_email": sender, "amount_gross": 0, "vat": 0, "category": "Inne", "status": "error"}
