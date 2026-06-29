@@ -71,7 +71,7 @@ class ImapConfig(BaseModel):
     username: str
     password: str
     folder: str = "INBOX"
-    days_back: int = 30
+    days_back: float = 1
 
 class ScanRequest(BaseModel):
     imap: ImapConfig
@@ -139,7 +139,11 @@ async def scan_mailbox(req: ScanRequest):
 
     try:
         mail.select(config.folder)
-        since = (datetime.now() - timedelta(days=config.days_back)).strftime("%d-%b-%Y")
+        # Obsługa ułamkowych dni (np. 0.042 = 1 godzina, 1 = 24 godziny)
+        delta = timedelta(hours=config.days_back * 24)
+        since_dt = datetime.now() - delta
+        since = since_dt.strftime("%d-%b-%Y")
+        print(f"[SCAN] Skanowanie od: {since} (cofnięcie: {config.days_back} dni = {config.days_back*24:.1f}h)")
         _, ids_raw = mail.search(None, f'(SINCE "{since}")')
         ids = ids_raw[0].split()[-100:]  # max 100 emaili
         print(f"[SCAN] Emaili do analizy: {len(ids)}")
