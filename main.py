@@ -1,7 +1,5 @@
 """
-KsięgoBot Backend — FastAPI + IMAP + Claude AI
-Uruchom lokalnie: uvicorn main:app --reload
-Na Render.com: automatyczne uruchomienie przez Procfile
+KsięgoBot Backend — FastAPI + IMAP + Claude AI + Supabase
 """
 
 import imaplib
@@ -14,14 +12,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import anthropic
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── APP ──
-app = FastAPI(title="KsięgoBot API", version="1.0.0")
+app = FastAPI(title="KsięgoBot API", version="2.0.0")
 
-# Pozwól na połączenia z dowolnej domeny (w produkcji ogranicz do swojej domeny)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +28,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── MODELE DANYCH ──
+# ── CONFIG ──
+SUPABASE_URL     = os.environ.get("SUPABASE_URL", "https://elfibvwjskmíaugxjckf.supabase.co")
+SUPABASE_SECRET  = os.environ.get("SUPABASE_SECRET_KEY", "")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# ── SUPABASE HELPER ──
+def sb_headers():
+    return {
+        "apikey": SUPABASE_SECRET,
+        "Authorization": f"Bearer {SUPABASE_SECRET}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+async def sb_insert(table: str, data: dict):
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=sb_headers(),
+            json=data,
+            timeout=10,
+        )
+        return r.json()
+
+async def sb_select(table: str, filters: str = ""):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}?{filters}&order=created_at.desc",
+            headers=sb_headers(),
+            timeout=10,
+        )
+        return r.json()
+
+async def sb_delete(table: str, filters: str):
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/{table}?{filters}",
+            headers=sb_headers(),
+            timeout=10,
+        )
+        return r.status_code
+
+# ── MODELE ──
 class ImapConfig(BaseModel):
     host: str
     port: int = 993
@@ -43,56 +83,101 @@ class ImapConfig(BaseModel):
 
 class ScanRequest(BaseModel):
     imap: ImapConfig
+    client_email: Optional[str] = ""
 
-# ── KLIENT ANTHROPIC ──
-def get_claude():
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Brak klucza ANTHROPIC_API_KEY")
-    return anthropic.Anthropic(api_key=api_key)
-
+class ChatRequest(BaseModel):
+    question: str
+    client_email: Optional[str] = ""
+    invoices: list = []
 
 # ─────────────────────────────────────────────
-# ENDPOINT: Test połączenia IMAP
+# SETUP — Utwórz tabele w Supabase (wywołaj raz)
+# ─────────────────────────────────────────────
+@app.post("/api/setup-db")
+async def setup_db():
+    """
+    Tworzy tabele w Supabase przez SQL Editor.
+    Wywołaj raz po podpięciu bazy.
+    """
+    sql = """
+    CREATE TABLE IF NOT EXISTS invoices (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        client_email TEXT NOT NULL,
+        vendor TEXT,
+        invoice_number TEXT,
+        date DATE,
+        due_date DATE,
+        amount_net NUMERIC(12,2) DEFAULT 0,
+        amount_gross NUMERIC(12,2) DEFAULT 0,
+        vat NUMERIC(12,2) DEFAULT 0,
+        vat_rate NUMERIC(5,2),
+        category TEXT DEFAULT 'Inne',
+        description TEXT,
+        currency TEXT DEFAULT 'PLN',
+        is_cost_deductible BOOLEAN DEFAULT false,
+        confidence TEXT DEFAULT 'medium',
+        source_email TEXT,
+        source_subject TEXT,
+        filename TEXT,
+        status TEXT DEFAULT 'ok',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS imap_configs (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        client_email TEXT UNIQUE NOT NULL,
+        imap_host TEXT NOT NULL,
+        imap_port INTEGER DEFAULT 993,
+        use_ssl BOOLEAN DEFAULT true,
+        folder TEXT DEFAULT 'INBOX',
+        last_scan TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_logs (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        client_email TEXT NOT NULL,
+        scanned_emails INTEGER DEFAULT 0,
+        invoices_found INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'ok',
+        message TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """
+    return {
+        "success": True,
+        "message": "Uruchom poniższy SQL w Supabase SQL Editor (Database → SQL Editor)",
+        "sql": sql
+    }
+
+# ─────────────────────────────────────────────
+# IMAP TEST
 # ─────────────────────────────────────────────
 @app.post("/api/imap/test")
 def test_imap(config: ImapConfig):
-    """Sprawdza czy dane IMAP są poprawne i skrzynka dostępna."""
     try:
         if config.use_ssl:
             mail = imaplib.IMAP4_SSL(config.host, config.port)
         else:
             mail = imaplib.IMAP4(config.host, config.port)
-
         mail.login(config.username, config.password)
-        status, folders = mail.list()
         mail.logout()
-
-        return {
-            "success": True,
-            "message": f"Połączenie z {config.host} udane. Skrzynka dostępna.",
-            "email": config.username
-        }
+        return {"success": True, "message": f"Połączenie z {config.host} udane.", "email": config.username}
     except imaplib.IMAP4.error as e:
-        raise HTTPException(status_code=401, detail=f"Błąd logowania IMAP: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Błąd logowania: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd połączenia: {str(e)}")
 
-
 # ─────────────────────────────────────────────
-# ENDPOINT: Skanuj skrzynkę i analizuj faktury
+# SCAN — Skanuj skrzynkę i zapisz do Supabase
 # ─────────────────────────────────────────────
 @app.post("/api/scan")
-def scan_mailbox(req: ScanRequest):
-    """
-    Łączy się ze skrzynką IMAP, szuka emaili z załącznikami PDF/JPG/PNG,
-    analizuje je przez Claude AI i zwraca listę faktur.
-    """
+async def scan_mailbox(req: ScanRequest):
     config = req.imap
     invoices = []
     errors = []
 
-    # 1. Połącz z IMAP
+    # Połącz z IMAP
     try:
         if config.use_ssl:
             mail = imaplib.IMAP4_SSL(config.host, config.port)
@@ -100,81 +185,58 @@ def scan_mailbox(req: ScanRequest):
             mail = imaplib.IMAP4(config.host, config.port)
         mail.login(config.username, config.password)
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Błąd połączenia IMAP: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
 
     try:
-        # 2. Wybierz folder
         mail.select(config.folder)
-
-        # 3. Zbuduj zapytanie IMAP
         since_date = (datetime.now() - timedelta(days=config.days_back)).strftime("%d-%b-%Y")
-        search_criteria = f'(SINCE "{since_date}")'
+        status, message_ids = mail.search(None, f'(SINCE "{since_date}")')
+        ids = message_ids[0].split()[-50:]
 
-        # Dodaj filtr słów kluczowych jeśli podano
-        if config.keywords:
-            keywords = [k.strip() for k in config.keywords.split(",") if k.strip()]
-            if keywords:
-                # Szukaj emaili zawierających którekolwiek słowo kluczowe w temacie
-                keyword_criteria = " ".join([f'(SUBJECT "{kw}")' for kw in keywords[:3]])
-                search_criteria = f'(SINCE "{since_date}" OR {keyword_criteria} {keyword_criteria})'
+        claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-        # 4. Wyszukaj maile
-        status, message_ids = mail.search(None, search_criteria)
-        if status != "OK":
-            raise Exception("Błąd wyszukiwania emaili")
-
-        ids = message_ids[0].split()
-        # Ogranicz do ostatnich 50 emaili żeby nie przeciążyć
-        ids = ids[-50:]
-
-        claude = get_claude()
-
-        # 5. Przetwórz każdy email
         for msg_id in ids:
             try:
                 status, msg_data = mail.fetch(msg_id, "(RFC822)")
                 if status != "OK":
                     continue
-
-                raw_email = msg_data[0][1]
-                msg = email.message_from_bytes(raw_email)
-
-                # Dekoduj temat
+                msg = email.message_from_bytes(msg_data[0][1])
                 subject = _decode_header(msg.get("Subject", ""))
-                sender = msg.get("From", "")
-                date_str = msg.get("Date", "")
-
-                # 6. Znajdź załączniki PDF/JPG/PNG
+                sender  = msg.get("From", "")
                 attachments = _get_attachments(msg)
                 if not attachments:
                     continue
-
-                # 7. Analizuj każdy załącznik przez Claude
                 for att in attachments:
-                    invoice = _analyze_attachment_with_claude(
-                        claude=claude,
-                        filename=att["filename"],
-                        content=att["content"],
-                        content_type=att["content_type"],
-                        email_from=sender,
-                        email_subject=subject,
-                        email_date=date_str,
-                    )
-                    if invoice:
-                        invoices.append(invoice)
-
+                    inv = _analyze_with_claude(claude, att, sender, subject)
+                    if inv:
+                        inv["client_email"] = config.username
+                        # Zapisz do Supabase
+                        try:
+                            await sb_insert("invoices", inv)
+                        except Exception as db_err:
+                            errors.append(f"DB błąd: {str(db_err)}")
+                        invoices.append(inv)
             except Exception as e:
-                errors.append(f"Błąd przetwarzania emaila {msg_id}: {str(e)}")
-                continue
+                errors.append(str(e))
 
         mail.logout()
 
-    except Exception as e:
+        # Zapisz log skanowania
         try:
-            mail.logout()
+            await sb_insert("scan_logs", {
+                "client_email": config.username,
+                "scanned_emails": len(ids),
+                "invoices_found": len(invoices),
+                "status": "ok",
+                "message": f"Skanowanie zakończone. Emaili: {len(ids)}, Faktur: {len(invoices)}"
+            })
         except:
             pass
-        raise HTTPException(status_code=500, detail=f"Błąd skanowania: {str(e)}")
+
+    except Exception as e:
+        try: mail.logout()
+        except: pass
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "success": True,
@@ -185,249 +247,113 @@ def scan_mailbox(req: ScanRequest):
         "scanned_at": datetime.now().isoformat(),
     }
 
-
 # ─────────────────────────────────────────────
-# ENDPOINT: Analiza pojedynczego pliku (upload)
+# GET — Pobierz faktury z Supabase
 # ─────────────────────────────────────────────
-@app.post("/api/analyze")
-async def analyze_file(payload: dict):
-    """
-    Przyjmuje plik jako base64 i analizuje go przez Claude.
-    payload: { filename, content_base64, content_type }
-    """
+@app.get("/api/invoices/{client_email}")
+async def get_invoices(client_email: str):
     try:
-        claude = get_claude()
-        content = base64.b64decode(payload["content_base64"])
-        invoice = _analyze_attachment_with_claude(
-            claude=claude,
-            filename=payload.get("filename", "faktura"),
-            content=content,
-            content_type=payload.get("content_type", "application/pdf"),
-            email_from="",
-            email_subject="",
-            email_date="",
-        )
-        return {"success": True, "invoice": invoice}
+        data = await sb_select("invoices", f"client_email=eq.{client_email}")
+        return {"success": True, "invoices": data, "count": len(data)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# DELETE — Usuń fakturę
+# ─────────────────────────────────────────────
+@app.delete("/api/invoices/{invoice_id}")
+async def delete_invoice(invoice_id: str):
+    try:
+        await sb_delete("invoices", f"id=eq.{invoice_id}")
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINT: Zapytaj AI o faktury
+# CHAT
 # ─────────────────────────────────────────────
-class ChatRequest(BaseModel):
-    question: str
-    invoices: list = []
-
 @app.post("/api/chat")
-def chat(req: ChatRequest):
-    """Odpowiada na pytania użytkownika o jego faktury."""
-    claude = get_claude()
+async def chat(req: ChatRequest):
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-    context = ""
-    if req.invoices:
-        total = sum(i.get("amount_gross", 0) for i in req.invoices)
-        vat_total = sum(i.get("vat", 0) for i in req.invoices)
-        context = f"""
-Dane finansowe firmy:
-- Łączna wartość faktur: {total:.2f} zł
-- Łączny VAT do odliczenia: {vat_total:.2f} zł
-- Liczba faktur: {len(req.invoices)}
+    # Pobierz faktury z bazy jeśli nie przesłano
+    invoices = req.invoices
+    if not invoices and req.client_email:
+        try:
+            data = await sb_select("invoices", f"client_email=eq.{req.client_email}")
+            invoices = data
+        except:
+            pass
 
-Lista faktur:
-{json.dumps(req.invoices, ensure_ascii=False, indent=2)}
-"""
-    else:
-        context = "Brak faktur w systemie. Poinformuj użytkownika że powinien połączyć skrzynkę i uruchomić skanowanie."
+    context = f"Dane faktur: {json.dumps(invoices, ensure_ascii=False)}" if invoices else "Brak faktur."
 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=800,
-        messages=[{
-            "role": "user",
-            "content": f"""Jesteś profesjonalnym asystentem księgowym dla małej firmy. 
-Odpowiadaj po polsku, konkretnie i rzeczowo.
-Nie udzielasz porad prawnych ani podatkowych — informujesz o danych.
-
-{context}
-
-Pytanie użytkownika: {req.question}"""
-        }]
+        messages=[{"role": "user", "content": f"Jesteś asystentem księgowym. Odpowiadaj po polsku.\n{context}\n\nPytanie: {req.question}"}]
     )
-
-    return {
-        "success": True,
-        "answer": response.content[0].text,
-        "tokens_used": response.usage.output_tokens
-    }
-
+    return {"success": True, "answer": response.content[0].text}
 
 # ─────────────────────────────────────────────
-# ENDPOINT: Health check (Render.com tego wymaga)
+# HEALTH
 # ─────────────────────────────────────────────
 @app.get("/")
-def health():
-    return {"status": "ok", "service": "KsięgoBot API", "version": "1.0.0"}
+def root():
+    return {"status": "ok", "service": "KsięgoBot API", "version": "2.0.0"}
 
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "ok"}
 
-
 # ─────────────────────────────────────────────
-# FUNKCJE POMOCNICZE
+# HELPERS
 # ─────────────────────────────────────────────
-
-def _decode_header(header_value: str) -> str:
-    """Dekoduje nagłówek emaila (obsługuje UTF-8, ISO-8859-2 itp.)"""
-    if not header_value:
-        return ""
+def _decode_header(val):
     try:
-        decoded_parts = decode_header(header_value)
-        result = ""
-        for part, charset in decoded_parts:
-            if isinstance(part, bytes):
-                result += part.decode(charset or "utf-8", errors="replace")
-            else:
-                result += str(part)
-        return result
+        parts = decode_header(val)
+        return "".join(p.decode(c or "utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p, c in parts)
     except:
-        return str(header_value)
+        return str(val)
 
-
-def _get_attachments(msg) -> list:
-    """Wyciąga załączniki PDF/JPG/PNG z emaila."""
-    attachments = []
+def _get_attachments(msg):
+    result = []
     for part in msg.walk():
-        content_type = part.get_content_type()
-        content_disposition = str(part.get("Content-Disposition", ""))
-
-        # Sprawdź czy to załącznik z obsługiwanym typem
-        is_pdf = content_type == "application/pdf"
-        is_image = content_type in ["image/jpeg", "image/png", "image/jpg"]
-        is_attachment = "attachment" in content_disposition
-
-        if (is_pdf or is_image) and is_attachment:
+        ct = part.get_content_type()
+        cd = str(part.get("Content-Disposition", ""))
+        if ct in ("application/pdf", "image/jpeg", "image/png", "image/jpg") and "attachment" in cd:
             try:
-                filename = part.get_filename() or f"attachment.{content_type.split('/')[1]}"
-                filename = _decode_header(filename)
                 content = part.get_payload(decode=True)
-
-                if content and len(content) > 100:  # Ignoruj puste pliki
-                    attachments.append({
-                        "filename": filename,
-                        "content": content,
-                        "content_type": content_type,
-                    })
+                if content and len(content) > 100:
+                    result.append({"filename": _decode_header(part.get_filename() or "file"), "content": content, "content_type": ct})
             except:
-                continue
+                pass
+    return result
 
-    return attachments
-
-
-def _analyze_attachment_with_claude(
-    claude, filename: str, content: bytes,
-    content_type: str, email_from: str,
-    email_subject: str, email_date: str
-) -> Optional[dict]:
-    """
-    Wysyła załącznik do Claude API i parsuje odpowiedź jako dane faktury.
-    Claude obsługuje zarówno PDF jak i obrazy natywnie.
-    """
+def _analyze_with_claude(claude, att, sender, subject):
     try:
-        # Zakoduj plik do base64
-        content_b64 = base64.standard_b64encode(content).decode("utf-8")
+        b64 = base64.standard_b64encode(att["content"]).decode()
+        ct  = att["content_type"]
+        media_type = ct if ct != "image/jpg" else "image/jpeg"
+        doc_block = {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": b64}} if ct == "application/pdf" \
+               else {"type": "image",    "source": {"type": "base64", "media_type": media_type, "data": b64}}
 
-        # Sprawdź typ dla API
-        if content_type == "application/pdf":
-            media_type = "application/pdf"
-            doc_type = "document"
-        elif content_type in ["image/jpeg", "image/jpg"]:
-            media_type = "image/jpeg"
-            doc_type = "image"
-        elif content_type == "image/png":
-            media_type = "image/png"
-            doc_type = "image"
-        else:
-            return None
+        prompt = f"""Przeanalizuj ten dokument. Zwróć TYLKO JSON bez markdown:
+{{"vendor":"nazwa","invoice_number":"numer lub null","date":"YYYY-MM-DD lub null","due_date":"YYYY-MM-DD lub null",
+"amount_net":0,"amount_gross":0,"vat":0,"vat_rate":23,"category":"IT/Marketing/Biuro/Usługi/Inne",
+"description":"opis","currency":"PLN","is_cost_deductible":true,"confidence":"high/medium/low"}}
+Email od: {sender} | Temat: {subject} | Plik: {att['filename']}"""
 
-        # Zbuduj wiadomość do Claude
-        if doc_type == "document":
-            file_content = {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": content_b64
-                }
-            }
-        else:
-            file_content = {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": content_b64
-                }
-            }
-
-        prompt = f"""Przeanalizuj ten dokument. To prawdopodobnie faktura lub rachunek.
-Kontekst emaila:
-- Od: {email_from}
-- Temat: {email_subject}
-- Data emaila: {email_date}
-- Nazwa pliku: {filename}
-
-Zwróć TYLKO JSON bez żadnego dodatkowego tekstu, bez markdown, bez backticks:
-{{
-  "vendor": "nazwa dostawcy/wystawcy faktury",
-  "invoice_number": "numer faktury lub null",
-  "date": "data faktury YYYY-MM-DD lub null",
-  "due_date": "termin płatności YYYY-MM-DD lub null",
-  "amount_net": wartość netto jako liczba lub 0,
-  "amount_gross": wartość brutto jako liczba lub 0,
-  "vat": kwota VAT jako liczba lub 0,
-  "vat_rate": stawka VAT jako liczba np. 23 lub null,
-  "category": "IT/Marketing/Biuro/Usługi/Inne",
-  "description": "krótki opis 1 zdanie",
-  "currency": "PLN/EUR/USD/GBP",
-  "is_cost_deductible": true lub false,
-  "confidence": "high/medium/low"
-}}"""
-
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            messages=[{
-                "role": "user",
-                "content": [file_content, {"type": "text", "text": prompt}]
-            }]
+        r = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=500,
+            messages=[{"role": "user", "content": [doc_block, {"type": "text", "text": prompt}]}]
         )
-
-        raw = response.content[0].text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-
-        # Dodaj metadane emaila
-        data["source_email"] = email_from
-        data["source_subject"] = email_subject
-        data["filename"] = filename
-        data["processed_at"] = datetime.now().isoformat()
-        data["status"] = "ok"
-
+        data = json.loads(r.content[0].text.replace("```json","").replace("```","").strip())
+        data["source_email"]   = sender
+        data["source_subject"] = subject
+        data["filename"]       = att["filename"]
+        data["status"]         = "ok"
         return data
-
-    except json.JSONDecodeError:
-        # Jeśli Claude nie zwrócił JSON, zwróć podstawowe dane
-        return {
-            "vendor": email_from.split("@")[0] if email_from else "Nieznany",
-            "filename": filename,
-            "source_email": email_from,
-            "amount_gross": 0,
-            "vat": 0,
-            "category": "Inne",
-            "description": f"Nie udało się automatycznie przetworzyć: {filename}",
-            "status": "error",
-            "processed_at": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        return None
+    except:
+        return {"vendor": sender.split("@")[0], "filename": att["filename"],
+                "source_email": sender, "amount_gross": 0, "vat": 0,
+                "category": "Inne", "status": "error"}
