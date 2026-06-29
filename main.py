@@ -193,12 +193,13 @@ async def scan_mailbox(req: ScanRequest):
                 # Zbuduj rekord emaila
                 email_record = {
                     "client_email":   config.username,
+                    "message_id":     message_id[:500],
                     "category":       category,
                     "sender":         str(sender)[:255],
                     "subject":        str(subject)[:500],
                     "date":           _to_date(date),
                     "summary":        str(classification.get("summary", ""))[:1000],
-                    "priority":       str(classification.get("priority", "normal"))[:20],
+                    "priority":       str(classification.get("priority", "normalny"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
                     "action_desc":    str(classification.get("action_desc", ""))[:500],
                     "has_attachment": len(atts) > 0,
@@ -378,44 +379,42 @@ def _get_attachments(msg):
     return result
 
 def _classify_email(claude, subject, sender, body, atts, date) -> dict:
-    """Klasyfikuje email do jednej z kategorii."""
+    """Klasyfikuje email — używa Haiku (tani) zamiast Sonnet."""
     has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
-    prompt = f"""Przeanalizuj email i zwróć TYLKO JSON bez markdown:
-
-{{
-  "category": "faktura|zapytanie|zamowienie|platnosc|spam|inne",
-  "priority": "wysoki|normalny|niski",
-  "summary": "1-2 zdania co zawiera email",
-  "action_needed": true/false,
-  "action_desc": "co należy zrobić lub null",
-  "suggested_response": "propozycja odpowiedzi jeśli to zapytanie lub null"
-}}
-
-Definicje kategorii:
-- faktura: faktura VAT, rachunek, paragon, potwierdzenie zakupu z kwotą
-- zapytanie: klient lub kontrahent pyta o cenę, ofertę, współpracę, dostępność
-- zamowienie: ktoś składa zamówienie na produkt lub usługę
-- platnosc: potwierdzenie przelewu, wpłaty, rozliczenia
-- spam: reklama, newsletter, nieistotne powiadomienie
-- inne: wszystko inne
-
-Email:
-Od: {sender}
-Temat: {subject}
-Data: {date}
-Ma załącznik PDF: {has_pdf}
-Treść: {body[:800]}"""
+    # Krótki, precyzyjny prompt = mniej tokenów = niższy koszt
+    prompt = f"""Klasyfikuj email. JSON tylko, bez markdown:
+{{"category":"faktura|zapytanie|zamowienie|platnosc|spam|inne","priority":"wysoki|normalny|niski","summary":"max 1 zdanie","action_needed":true/false,"action_desc":"co zrobić lub null"}}
+Kategorie: faktura=FV/rachunek/paragon, zapytanie=pytanie o cenę/ofertę, zamowienie=składanie zamówienia, platnosc=potwierdzenie przelewu, spam=reklama/newsletter, inne=reszta
+Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Treść: {body[:300]}"""
 
     try:
+        # Haiku — 20x tańszy od Sonnet, wystarczy do klasyfikacji
         r = claude.messages.create(
-            model="claude-sonnet-4-6", max_tokens=400,
+            model="claude-haiku-4-5",
+            max_tokens=150,
             messages=[{"role": "user", "content": prompt}])
-        raw = r.content[0].text.replace("```json", "").replace("```", "").strip()
+        raw = r.content[0].text.replace("```json","").replace("```","").strip()
         return json.loads(raw)
     except Exception as e:
         print(f"[AI] Błąd klasyfikacji: {e}")
-        return {"category": "inne", "priority": "normalny",
-                "summary": subject, "action_needed": False}
+        # Fallback: prosta klasyfikacja po słowach kluczowych bez API
+        return _classify_by_keywords(subject, sender, has_pdf)
+
+def _classify_by_keywords(subject: str, sender: str, has_pdf: bool) -> dict:
+    """Klasyfikacja bez AI — fallback gdy API niedostępne."""
+    s = subject.lower()
+    sndr = sender.lower()
+    if has_pdf or any(w in s for w in ["faktura","invoice","fv/","rachunek","paragon","receipt"]):
+        return {"category":"faktura","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdź fakturę"}
+    if any(w in s for w in ["zamówienie","order","status zamówienia","wysyłka","paczka","dostawa"]):
+        return {"category":"zamowienie","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None}
+    if any(w in s for w in ["przelew","płatność","payment","transakcja","potwierdzenie zapłaty"]):
+        return {"category":"platnosc","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdź płatność"}
+    if any(w in s for w in ["zapytanie","oferta","wycena","współpraca","pytanie"]):
+        return {"category":"zapytanie","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie"}
+    if any(w in sndr for w in ["newsletter","noreply","no-reply","marketing","promo","info@"]):
+        return {"category":"spam","priority":"niski","summary":subject,"action_needed":False,"action_desc":None}
+    return {"category":"inne","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None}
 
 def _analyze_invoice(claude, att, sender, subject) -> Optional[dict]:
     """Analizuje PDF faktury i wyciąga dane."""
