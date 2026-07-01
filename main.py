@@ -1,4 +1,4 @@
-"""
+﻿"""
 KsięgoBot Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
 Pełna klasyfikacja emaili: faktury, zapytania, zamówienia, płatności
 """
@@ -80,6 +80,13 @@ class ChatRequest(BaseModel):
     question: str
     client_email: Optional[str] = ""
     invoices: list = []
+
+class ReplyRequest(BaseModel):
+    imap: ImapConfig
+    to: str
+    subject: str
+    body: str
+    in_reply_to: Optional[str] = ""
 
 # ── KATEGORIE EMAILI ──
 EMAIL_CATEGORIES = {
@@ -203,6 +210,8 @@ async def scan_mailbox(req: ScanRequest):
                     "priority":       str(classification.get("priority", "normalny"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
                     "action_desc":    str(classification.get("action_desc", ""))[:500],
+                    "reply_approve":  str(classification.get("reply_approve") or "")[:3000] or None,
+                    "reply_reject":   str(classification.get("reply_reject") or "")[:3000] or None,
                     "has_attachment": len(atts) > 0,
                     "status":         "nowe",
                 }
@@ -324,6 +333,50 @@ async def chat(req: ChatRequest):
                    f"{ctx}\n\nPytanie: {req.question}"}])
     return {"success": True, "answer": r.content[0].text}
 
+SMTP_PRESETS = {
+    "imap.gmail.com":             ("smtp.gmail.com", 587),
+    "outlook.office365.com":      ("smtp.office365.com", 587),
+    "imap.wp.pl":                 ("smtp.wp.pl", 587),
+    "imap.poczta.onet.pl":        ("smtp.poczta.onet.pl", 465),
+    "poczta.interia.pl":          ("poczta.interia.pl", 587),
+}
+
+@app.post("/api/emails/reply")
+async def send_reply(req: ReplyRequest):
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    imap_host = req.imap.host.lower()
+    smtp_host, smtp_port = SMTP_PRESETS.get(imap_host, (imap_host.replace("imap.", "smtp."), 587))
+
+    msg = MIMEMultipart("alternative")
+    msg["From"]    = req.imap.username
+    msg["To"]      = req.to
+    msg["Subject"] = req.subject if req.subject.startswith("Re:") else f"Re: {req.subject}"
+    if req.in_reply_to:
+        msg["In-Reply-To"] = req.in_reply_to
+        msg["References"]  = req.in_reply_to
+    msg.attach(MIMEText(req.body, "plain", "utf-8"))
+
+    try:
+        if smtp_port == 465:
+            import ssl
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=15) as s:
+                s.login(req.imap.username, req.imap.password)
+                s.sendmail(req.imap.username, req.to, msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                s.starttls()
+                s.login(req.imap.username, req.imap.password)
+                s.sendmail(req.imap.username, req.to, msg.as_string())
+        print(f"[SMTP] Wysłano odpowiedź do {req.to}")
+        return {"success": True, "message": f"Odpowiedź wysłana do {req.to}"}
+    except Exception as e:
+        print(f"[SMTP] Błąd: {e}")
+        raise HTTPException(status_code=500, detail=f"Błąd wysyłki: {str(e)}")
+
 # ── HELPERS ──
 def _decode_hdr(val):
     try:
@@ -378,44 +431,50 @@ def _get_attachments(msg):
             except: pass
     return result
 
-def _classify_email(claude, subject, sender, body, atts, date) -> dict:
-    """Klasyfikuje email — używa Haiku (tani) zamiast Sonnet."""
-    has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
-    # Krótki, precyzyjny prompt = mniej tokenów = niższy koszt
-    prompt = f"""Klasyfikuj email. JSON tylko, bez markdown:
-{{"category":"faktura|reklamacja|zapytanie|zamowienie|spam|inne","priority":"wysoki|normalny|niski","summary":"max 1 zdanie po polsku","action_needed":true/false,"action_desc":"co zrobić lub null"}}
-Kategorie: faktura=FV/rachunek/paragon/invoice, reklamacja=zwrot/skarга/complaint/problem z zamówieniem, zapytanie=pytanie o cenę/ofertę/wycenę, zamowienie=potwierdzenie zamówienia/wysyłka/paczka, spam=reklama/newsletter/promocja, inne=reszta
-Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Treść: {body[:300]}"""
+REPLY_CATEGORIES = {"faktura", "reklamacja", "zapytanie", "zamowienie"}
 
+def _classify_email(claude, subject, sender, body, atts, date) -> dict:
+    """Klasyfikuje email i generuje propozycje odpowiedzi — Haiku (tani)."""
+    has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
+    prompt = (
+        'Klasyfikuj email i napisz dwie formalne odpowiedzi po polsku. JSON tylko, bez markdown:\n'
+        '{"category":"faktura|reklamacja|zapytanie|zamowienie|spam|inne",'
+        '"priority":"wysoki|normalny|niski","summary":"max 1 zdanie po polsku",'
+        '"action_needed":true/false,"action_desc":"co zrobic lub null",'
+        '"reply_approve":"pelna formalna odpowiedz ZATWIERDZAJACA z powitaniem i pozegnaniem (null dla spam/inne)",'
+        '"reply_reject":"pelna formalna odpowiedz ODRZUCAJACA z powitaniem i pozegnaniem (null dla spam/inne)"}\n'
+        'Kategorie: faktura=FV/rachunek/paragon/invoice, reklamacja=zwrot/skarga/complaint/problem,'
+        ' zapytanie=pytanie o cene/oferte/wycene, zamowienie=potwierdzenie/wysylka/paczka,'
+        ' spam=reklama/newsletter, inne=reszta\n'
+        'Odpowiedzi tylko dla: faktura, reklamacja, zapytanie, zamowienie. Styl: formalny, profesjonalny, po polsku.\n'
+        f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body[:400]}'
+    )
     try:
-        # Haiku — 20x tańszy od Sonnet, wystarczy do klasyfikacji
         r = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=150,
+            max_tokens=900,
             messages=[{"role": "user", "content": prompt}])
         raw = r.content[0].text.replace("```json","").replace("```","").strip()
         return json.loads(raw)
     except Exception as e:
-        print(f"[AI] Błąd klasyfikacji: {e}")
-        # Fallback: prosta klasyfikacja po słowach kluczowych bez API
+        print(f"[AI] Blad klasyfikacji: {e}")
         return _classify_by_keywords(subject, sender, has_pdf)
 
 def _classify_by_keywords(subject: str, sender: str, has_pdf: bool) -> dict:
-    """Klasyfikacja bez AI — fallback gdy API niedostępne."""
+    """Klasyfikacja bez AI — fallback gdy API niedostepne."""
     s = subject.lower()
     sndr = sender.lower()
     if has_pdf or any(w in s for w in ["faktura","invoice","fv/","rachunek","paragon","receipt"]):
-        return {"category":"faktura","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdź fakturę"}
-    if any(w in s for w in ["zamówienie","order","status zamówienia","wysyłka","paczka","dostawa"]):
-        return {"category":"zamowienie","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None}
-    if any(w in s for w in ["reklamacja","zwrot","skarга","complaint","problem z zamówieniem","niezgodność"]):
-        return {"category":"reklamacja","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Rozpatrz reklamację"}
-    if any(w in s for w in ["zapytanie","oferta","wycena","współpraca","pytanie"]):
-        return {"category":"zapytanie","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie"}
+        return {"category":"faktura","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdz fakture","reply_approve":None,"reply_reject":None}
+    if any(w in s for w in ["zamowienie","order","wysylka","paczka","dostawa"]):
+        return {"category":"zamowienie","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
+    if any(w in s for w in ["reklamacja","zwrot","complaint","problem","niezgodnosc"]):
+        return {"category":"reklamacja","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Rozpatrz reklamacje","reply_approve":None,"reply_reject":None}
+    if any(w in s for w in ["zapytanie","oferta","wycena","wspolpraca","pytanie"]):
+        return {"category":"zapytanie","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie","reply_approve":None,"reply_reject":None}
     if any(w in sndr for w in ["newsletter","noreply","no-reply","marketing","promo","info@"]):
-        return {"category":"spam","priority":"niski","summary":subject,"action_needed":False,"action_desc":None}
-    return {"category":"inne","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None}
-
+        return {"category":"spam","priority":"niski","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
+    return {"category":"inne","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
 def _analyze_invoice(claude, att, sender, subject) -> Optional[dict]:
     """Analizuje PDF faktury i wyciąga dane."""
     try:
