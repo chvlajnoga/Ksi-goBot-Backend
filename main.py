@@ -83,12 +83,12 @@ class ChatRequest(BaseModel):
 
 # ── KATEGORIE EMAILI ──
 EMAIL_CATEGORIES = {
-    "faktura":    {"label": "Faktura",             "color": "#c9a84c", "icon": "🧾"},
-    "zapytanie":  {"label": "Zapytanie ofertowe",  "color": "#4a8fe8", "icon": "❓"},
-    "zamowienie": {"label": "Zamówienie",           "color": "#2eb87a", "icon": "📦"},
-    "platnosc":   {"label": "Potwierdzenie płatności", "color": "#8a6be8", "icon": "💳"},
-    "spam":       {"label": "Spam / Nieistotne",   "color": "#5a5752", "icon": "🗑️"},
-    "inne":       {"label": "Inne",                "color": "#5a5752", "icon": "📧"},
+    "faktura":    {"label": "Faktura",    "color": "#c9a84c", "icon": "🧾"},
+    "reklamacja": {"label": "Reklamacja", "color": "#e05252", "icon": "⚠️"},
+    "zapytanie":  {"label": "Zapytanie",  "color": "#4a8fe8", "icon": "❓"},
+    "zamowienie": {"label": "Zamówienie", "color": "#2eb87a", "icon": "📦"},
+    "spam":       {"label": "Spam",       "color": "#5a5752", "icon": "🗑️"},
+    "inne":       {"label": "Inne",       "color": "#5a5752", "icon": "📧"},
 }
 
 # ── ENDPOINTS ──
@@ -124,8 +124,8 @@ def test_imap(config: ImapConfig):
 @app.post("/api/scan")
 async def scan_mailbox(req: ScanRequest):
     config = req.imap
-    results = {"faktury": [], "zapytania": [], "zamowienia": [],
-               "platnosci": [], "spam": [], "inne": []}
+    results = {"faktury": [], "reklamacje": [], "zapytania": [],
+               "zamowienia": [], "spam": [], "inne": []}
     errors = []
 
     print(f"[SCAN] Start: {config.username}")
@@ -198,6 +198,7 @@ async def scan_mailbox(req: ScanRequest):
                     "sender":         str(sender)[:255],
                     "subject":        str(subject)[:500],
                     "date":           _to_date(date),
+                    "body":           str(body)[:3000],
                     "summary":        str(classification.get("summary", ""))[:1000],
                     "priority":       str(classification.get("priority", "normalny"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
@@ -235,25 +236,12 @@ async def scan_mailbox(req: ScanRequest):
                                 await sb_insert("invoices", db)
                                 results["faktury"].append(inv)
 
-                # Jeśli to ZAPYTANIE — zapisz do osobnej tabeli
+                elif category == "reklamacja":
+                    results["reklamacje"].append({"subject": subject, "sender": sender})
                 elif category == "zapytanie":
-                    inquiry = {
-                        "client_email": config.username,
-                        "sender":       str(sender)[:255],
-                        "subject":      str(subject)[:500],
-                        "date":         _to_date(date),
-                        "summary":      str(classification.get("summary", ""))[:1000],
-                        "suggested_response": str(
-                            classification.get("suggested_response", ""))[:2000],
-                        "status":       "nowe",
-                    }
-                    await sb_insert("inquiries", inquiry)
-                    results["zapytania"].append(inquiry)
-
+                    results["zapytania"].append({"subject": subject, "sender": sender})
                 elif category == "zamowienie":
                     results["zamowienia"].append({"subject": subject, "sender": sender})
-                elif category == "platnosc":
-                    results["platnosci"].append({"subject": subject, "sender": sender})
                 elif category == "spam":
                     results["spam"].append({"subject": subject})
                 else:
@@ -395,8 +383,8 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
     has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
     # Krótki, precyzyjny prompt = mniej tokenów = niższy koszt
     prompt = f"""Klasyfikuj email. JSON tylko, bez markdown:
-{{"category":"faktura|zapytanie|zamowienie|platnosc|spam|inne","priority":"wysoki|normalny|niski","summary":"max 1 zdanie","action_needed":true/false,"action_desc":"co zrobić lub null"}}
-Kategorie: faktura=FV/rachunek/paragon, zapytanie=pytanie o cenę/ofertę, zamowienie=składanie zamówienia, platnosc=potwierdzenie przelewu, spam=reklama/newsletter, inne=reszta
+{{"category":"faktura|reklamacja|zapytanie|zamowienie|spam|inne","priority":"wysoki|normalny|niski","summary":"max 1 zdanie po polsku","action_needed":true/false,"action_desc":"co zrobić lub null"}}
+Kategorie: faktura=FV/rachunek/paragon/invoice, reklamacja=zwrot/skarга/complaint/problem z zamówieniem, zapytanie=pytanie o cenę/ofertę/wycenę, zamowienie=potwierdzenie zamówienia/wysyłka/paczka, spam=reklama/newsletter/promocja, inne=reszta
 Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Treść: {body[:300]}"""
 
     try:
@@ -420,8 +408,8 @@ def _classify_by_keywords(subject: str, sender: str, has_pdf: bool) -> dict:
         return {"category":"faktura","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdź fakturę"}
     if any(w in s for w in ["zamówienie","order","status zamówienia","wysyłka","paczka","dostawa"]):
         return {"category":"zamowienie","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None}
-    if any(w in s for w in ["przelew","płatność","payment","transakcja","potwierdzenie zapłaty"]):
-        return {"category":"platnosc","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdź płatność"}
+    if any(w in s for w in ["reklamacja","zwrot","skarга","complaint","problem z zamówieniem","niezgodność"]):
+        return {"category":"reklamacja","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Rozpatrz reklamację"}
     if any(w in s for w in ["zapytanie","oferta","wycena","współpraca","pytanie"]):
         return {"category":"zapytanie","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie"}
     if any(w in sndr for w in ["newsletter","noreply","no-reply","marketing","promo","info@"]):
@@ -494,6 +482,16 @@ def _to_float(val):
 
 def _to_date(val):
     if not val: return None
-    s = str(val)
-    if re.match(r"\d{4}-\d{2}-\d{2}", s): return s[:10]
+    s = str(val).strip()
+    # Już ISO datetime
+    if re.match(r"\d{4}-\d{2}-\d{2}T", s): return s[:19]
+    # Już sama data
+    if re.match(r"\d{4}-\d{2}-\d{2}$", s): return s
+    # Format IMAP: "Mon, 30 Jun 2025 14:23:45 +0200"
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime(s)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        pass
     return None
