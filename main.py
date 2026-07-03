@@ -55,6 +55,12 @@ async def sb_exists(table: str, filters: str) -> bool:
         data = r.json()
         return isinstance(data, list) and len(data) > 0
 
+async def sb_patch(table: str, filters: str, data: dict):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}"
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(url, headers=sb_headers(), json=data, timeout=15)
+    return r
+
 async def sb_upsert(table: str, data: dict, on_conflict: str):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {**sb_headers(), "Prefer": f"resolution=merge-duplicates,return=representation"}
@@ -310,6 +316,38 @@ async def get_emails(client_email: str, category: str = ""):
         filters += f"&category=eq.{category}"
     data = await sb_select("emails", filters)
     return {"success": True, "emails": data, "count": len(data)}
+
+@app.post("/api/emails/reclassify/{client_email:path}")
+async def reclassify_emails(client_email: str):
+    """Ponownie klasyfikuje juz zapisane maile (kategoria + priorytet) wg aktualnych zasad AI.
+    Potrzebne bo /api/scan pomija juz zapisane maile jako duplikaty i nigdy ich nie przeklasyfikuje."""
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    emails = await sb_select("emails", f"client_email=eq.{client_email}")
+    updated, errors = 0, []
+    for em in emails:
+        try:
+            atts = [{"content_type": "application/pdf"}] if em.get("has_attachment") else []
+            classification = _classify_email(
+                claude, em.get("subject") or "", em.get("sender") or "",
+                em.get("body") or "", atts, em.get("date")
+            )
+            patch = {
+                "category":      classification.get("category", em.get("category", "inne")),
+                "priority":      classification.get("priority", "moze_poczekac"),
+                "summary":       str(classification.get("summary", ""))[:1000],
+                "action_needed": bool(classification.get("action_needed", False)),
+                "action_desc":   str(classification.get("action_desc") or "")[:500],
+                "reply_approve": str(classification.get("reply_approve") or "")[:3000] or None,
+                "reply_reject":  str(classification.get("reply_reject") or "")[:3000] or None,
+            }
+            r = await sb_patch("emails", f"id=eq.{em['id']}", patch)
+            if r.status_code in (200, 204):
+                updated += 1
+            else:
+                errors.append(f"{str(em.get('subject',''))[:40]}: {r.status_code}")
+        except Exception as e:
+            errors.append(f"{str(em.get('subject',''))[:40]}: {e}")
+    return {"success": True, "updated": updated, "total": len(emails), "errors": errors}
 
 @app.get("/api/invoices/{client_email:path}")
 async def get_invoices(client_email: str):
