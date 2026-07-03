@@ -98,6 +98,13 @@ EMAIL_CATEGORIES = {
     "inne":       {"label": "Inne",       "color": "#5a5752", "icon": "📧"},
 }
 
+# ── POZIOMY PILNOŚCI (niezależne od kategorii) ──
+PRIORITY_LEVELS = {
+    "pilne":          {"label": "Pilne",          "color": "#e05252"},
+    "wazne":          {"label": "Ważne",          "color": "#e8c74a"},
+    "moze_poczekac":  {"label": "Może poczekać",  "color": "#2eb87a"},
+}
+
 # ── ENDPOINTS ──
 @app.get("/")
 @app.get("/health")
@@ -207,7 +214,7 @@ async def scan_mailbox(req: ScanRequest):
                     "date":           _to_date(date),
                     "body":           str(body)[:3000],
                     "summary":        str(classification.get("summary", ""))[:1000],
-                    "priority":       str(classification.get("priority", "normalny"))[:20],
+                    "priority":       str(classification.get("priority", "moze_poczekac"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
                     "action_desc":    str(classification.get("action_desc", ""))[:500],
                     "reply_approve":  str(classification.get("reply_approve") or "")[:3000] or None,
@@ -437,17 +444,45 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
     """Klasyfikuje email i generuje propozycje odpowiedzi — Haiku (tani)."""
     has_pdf = any(a["content_type"] == "application/pdf" for a in atts)
     prompt = (
-        'Klasyfikuj email i napisz dwie formalne odpowiedzi po polsku. JSON tylko, bez markdown:\n'
+        'Jesteś doświadczonym specjalistą obsługi klienta. Przeanalizuj poniższy email '
+        'z NAJWYŻSZĄ UWAGĄ i przydziel go do DOKŁADNIE JEDNEJ kategorii. '
+        'Odpowiedz WYŁĄCZNIE czystym JSON, bez markdown:\n'
         '{"category":"faktura|reklamacja|zapytanie|zamowienie|spam|inne",'
-        '"priority":"wysoki|normalny|niski","summary":"max 1 zdanie po polsku",'
+        '"priority":"pilne|wazne|moze_poczekac","summary":"max 1 zdanie po polsku",'
         '"action_needed":true/false,"action_desc":"co zrobic lub null",'
         '"reply_approve":"pelna formalna odpowiedz ZATWIERDZAJACA z powitaniem i pozegnaniem (null dla spam/inne)",'
         '"reply_reject":"pelna formalna odpowiedz ODRZUCAJACA z powitaniem i pozegnaniem (null dla spam/inne)"}\n'
-        'Kategorie: faktura=FV/rachunek/paragon/invoice, reklamacja=zwrot/skarga/complaint/problem,'
-        ' zapytanie=pytanie o cene/oferte/wycene, zamowienie=potwierdzenie/wysylka/paczka,'
-        ' spam=reklama/newsletter, inne=reszta\n'
-        'Odpowiedzi tylko dla: faktura, reklamacja, zapytanie, zamowienie. Styl: formalny, profesjonalny, po polsku.\n'
-        f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body[:400]}'
+        '\n'
+        'ZASADY ROZRÓŻNIANIA (najczęstsza pomyłka — czytaj uważnie):\n'
+        '1) "zapytanie" — klient PYTA o cokolwiek związanego z transakcją, ZANIM doszło do złożenia zamówienia: '
+        'pyta o cenę, dostępność, ofertę, wycenę, warunki, termin, możliwość zakupu, szczegóły produktu/usługi. '
+        'Rozpoznaj to po: znaku zapytania, słowach "czy", "ile kosztuje", "jaka jest dostępność", "proszę o wycenę/ofertę/informację", '
+        '"chciałbym zapytać", "czy mogę zamówić/kupić" (to pytanie, więc mimo słowa "zamówić" to WCIĄŻ zapytanie!). '
+        'Klient jeszcze NIE zadeklarował ostatecznie zakupu — dopytuje.\n'
+        '2) "zamowienie" — klient JEDNOZNACZNIE SKŁADA lub POTWIERDZA zamówienie, bez pytania: '
+        'np. "Zamawiam 5 sztuk, proszę o realizację", "Składam zamówienie nr X", "Potwierdzam zamówienie", '
+        'podaje dane do wysyłki/faktury jako część już zdecydowanego zakupu, pyta o STATUS już złożonego zamówienia, '
+        'informuje o wysyłce/paczce/przesyłce dotyczącej istniejącego zamówienia. '
+        'Kluczowe: to STWIERDZENIE/DECYZJA, nie pytanie rozpoznawcze.\n'
+        '3) "faktura"=FV/rachunek/paragon/invoice (także gdy jest PDF w załączniku), '
+        '"reklamacja"=zwrot/skarga/complaint/problem/niezgodność, '
+        '"spam"=reklama/newsletter, "inne"=reszta.\n'
+        'W razie wątpliwości między zapytanie a zamowienie: jeśli w treści jest jakiekolwiek pytanie dotyczące transakcji '
+        '— wybierz "zapytanie". Wybierz "zamowienie" TYLKO gdy nie ma już nic do ustalenia, klient po prostu zamawia/potwierdza.\n'
+        '\n'
+        'USTALANIE PRIORYTETU (priority) — oceń NIEZALEŻNIE od kategorii, na podstawie realnej pilności sprawy '
+        'dla właściciela skrzynki. Przeczytaj CAŁĄ treść ze zrozumieniem, nie zgaduj po pojedynczych słowach:\n'
+        '- "pilne" (czerwony) — wymaga reakcji NATYCHMIAST: faktura z terminem płatności dziś/jutro lub już przeterminowana, '
+        'wezwanie do zapłaty/windykacja, poważna reklamacja lub wyraźnie zdenerwowany/niezadowolony klient, '
+        'klient grożący rezygnacją lub krokami prawnymi, wiadomość z dopiskiem "pilne"/"ASAP"/"natychmiast", '
+        'każda sytuacja grożąca realną stratą pieniędzy, klienta lub reputacji.\n'
+        '- "wazne" (żółty) — wymaga reakcji, ale nie od razu: standardowe zapytania ofertowe/cenowe, '
+        'nowe zamówienia oczekujące na potwierdzenie, faktura z odległym (kilkudniowym+) terminem płatności, '
+        'zwykła reklamacja bez oznak eskalacji, sprawy z rozsądnym terminem na odpowiedź.\n'
+        '- "moze_poczekac" (zielony) — czysto informacyjne, BEZ wymaganej pilnej akcji: potwierdzenia otrzymania, '
+        'powiadomienia o wysyłce/statusie bez problemu, spam/newslettery, luźna korespondencja, "inne".\n'
+        'Odpowiedzi (reply_approve/reply_reject) tylko dla: faktura, reklamacja, zapytanie, zamowienie. Styl: formalny, profesjonalny, po polsku.\n'
+        f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body[:600]}'
     )
     try:
         r = claude.messages.create(
@@ -458,23 +493,43 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         return json.loads(raw)
     except Exception as e:
         print(f"[AI] Blad klasyfikacji: {e}")
-        return _classify_by_keywords(subject, sender, has_pdf)
+        return _classify_by_keywords(subject, sender, has_pdf, body)
 
-def _classify_by_keywords(subject: str, sender: str, has_pdf: bool) -> dict:
+def _strip_diacritics(text: str) -> str:
+    """Zamienia polskie znaki na ich odpowiedniki ASCII, żeby dopasowanie słów kluczowych działało niezależnie od diakrytyków."""
+    table = str.maketrans("ąćęłńóśźż", "acelnoszz")
+    return text.translate(table)
+
+def _classify_by_keywords(subject: str, sender: str, has_pdf: bool, body: str = "") -> dict:
     """Klasyfikacja bez AI — fallback gdy API niedostepne."""
-    s = subject.lower()
+    s = _strip_diacritics((subject + " " + body[:300]).lower())
     sndr = sender.lower()
+    is_question = "?" in subject or "?" in body[:300] or \
+        any(w in s for w in ["czy ","ile kosztuje","jaka jest dostepnosc","prosze o wycene",
+                              "prosze o oferte","chcialbym zapytac","jaki jest termin"])
+    is_urgent = any(w in s for w in ["pilne","asap","natychmiast","dzisiaj","jak najszybciej",
+                                      "ostateczne wezwanie","zalegla","zaleglosc","windykacja",
+                                      "wezwanie do zaplaty","przeterminowana"])
+    is_upset = any(w in s for w in ["skandal","oburzony","niedopuszczalne","rezygnuje","rezygnacja",
+                                     "prawnik","sad ","natychmiastowego"])
+
     if has_pdf or any(w in s for w in ["faktura","invoice","fv/","rachunek","paragon","receipt"]):
-        return {"category":"faktura","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Sprawdz fakture","reply_approve":None,"reply_reject":None}
-    if any(w in s for w in ["zamowienie","order","wysylka","paczka","dostawa"]):
-        return {"category":"zamowienie","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
+        prio = "pilne" if is_urgent else "wazne"
+        return {"category":"faktura","priority":prio,"summary":subject,"action_needed":True,"action_desc":"Sprawdz fakture","reply_approve":None,"reply_reject":None}
     if any(w in s for w in ["reklamacja","zwrot","complaint","problem","niezgodnosc"]):
-        return {"category":"reklamacja","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Rozpatrz reklamacje","reply_approve":None,"reply_reject":None}
-    if any(w in s for w in ["zapytanie","oferta","wycena","wspolpraca","pytanie"]):
-        return {"category":"zapytanie","priority":"wysoki","summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie","reply_approve":None,"reply_reject":None}
+        prio = "pilne" if (is_urgent or is_upset) else "wazne"
+        return {"category":"reklamacja","priority":prio,"summary":subject,"action_needed":True,"action_desc":"Rozpatrz reklamacje","reply_approve":None,"reply_reject":None}
+    # pytanie o transakcje ma pierwszenstwo przed ogolnymi slowami zwiazanymi z zamowieniem
+    if is_question or any(w in s for w in ["zapytanie","oferta","wycena","wspolpraca","pytanie","cena","dostepnosc"]):
+        prio = "pilne" if is_urgent else "wazne"
+        return {"category":"zapytanie","priority":prio,"summary":subject,"action_needed":True,"action_desc":"Odpowiedz na zapytanie","reply_approve":None,"reply_reject":None}
+    if any(w in s for w in ["zamawiam","skladam zamowienie","potwierdzam zamowienie","numer zamowienia",
+                            "status zamowienia","zamowienie nr","order","wysylka","paczka","przesylka"]):
+        prio = "pilne" if is_urgent else "wazne"
+        return {"category":"zamowienie","priority":prio,"summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
     if any(w in sndr for w in ["newsletter","noreply","no-reply","marketing","promo","info@"]):
-        return {"category":"spam","priority":"niski","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
-    return {"category":"inne","priority":"normalny","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
+        return {"category":"spam","priority":"moze_poczekac","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
+    return {"category":"inne","priority":"moze_poczekac","summary":subject,"action_needed":False,"action_desc":None,"reply_approve":None,"reply_reject":None}
 def _analyze_invoice(claude, att, sender, subject) -> Optional[dict]:
     """Analizuje PDF faktury i wyciąga dane."""
     try:
