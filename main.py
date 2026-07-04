@@ -554,7 +554,7 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
     try:
         r = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=900,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}])
         raw = r.content[0].text.replace("```json","").replace("```","").strip()
         result = json.loads(raw)
@@ -597,7 +597,7 @@ def _fill_missing_reply(claude, category: str, kind: str, subject, sender, body)
     )
     try:
         r = claude.messages.create(
-            model="claude-haiku-4-5", max_tokens=500,
+            model="claude-haiku-4-5", max_tokens=800,
             messages=[{"role": "user", "content": prompt}])
         text = r.content[0].text.strip()
         return text or None
