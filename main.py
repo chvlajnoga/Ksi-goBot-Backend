@@ -61,6 +61,12 @@ async def sb_patch(table: str, filters: str, data: dict):
         r = await c.patch(url, headers=sb_headers(), json=data, timeout=15)
     return r
 
+async def sb_delete(table: str, filters: str):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}"
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(url, headers=sb_headers(), timeout=15)
+    return r
+
 async def sb_upsert(table: str, data: dict, on_conflict: str):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {**sb_headers(), "Prefer": f"resolution=merge-duplicates,return=representation"}
@@ -349,10 +355,20 @@ async def reclassify_emails(client_email: str):
             errors.append(f"{str(em.get('subject',''))[:40]}: {e}")
     return {"success": True, "updated": updated, "total": len(emails), "errors": errors}
 
+@app.delete("/api/emails/delete/{email_id}")
+async def delete_email(email_id: str):
+    r = await sb_delete("emails", f"id=eq.{email_id}")
+    return {"success": r.status_code in (200, 204)}
+
 @app.get("/api/invoices/{client_email:path}")
 async def get_invoices(client_email: str):
     data = await sb_select("invoices", f"client_email=eq.{client_email}")
     return {"success": True, "invoices": data, "count": len(data)}
+
+@app.delete("/api/invoices/{invoice_id}")
+async def delete_invoice(invoice_id: str):
+    r = await sb_delete("invoices", f"id=eq.{invoice_id}")
+    return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/inquiries/{client_email:path}")
 async def get_inquiries(client_email: str):
