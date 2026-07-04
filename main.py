@@ -2,7 +2,7 @@
 KsięgoBot Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
 Pełna klasyfikacja emaili: faktury, zapytania, zamówienia, płatności
 """
-import imaplib, email, base64, os, json, re
+import imaplib, email, base64, os, json, re, time, asyncio
 from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional
@@ -329,14 +329,20 @@ async def reclassify_emails(client_email: str):
     Potrzebne bo /api/scan pomija juz zapisane maile jako duplikaty i nigdy ich nie przeklasyfikuje."""
     claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     emails = await sb_select("emails", f"client_email=eq.{client_email}")
-    updated, errors = 0, []
-    for em in emails:
+    updated, skipped, errors = 0, 0, []
+    for i, em in enumerate(emails):
         try:
             atts = [{"content_type": "application/pdf"}] if em.get("has_attachment") else []
             classification = _classify_email(
                 claude, em.get("subject") or "", em.get("sender") or "",
                 em.get("body") or "", atts, em.get("date")
             )
+            # KRYTYCZNE: jesli AI zawiodlo (np. limit zapytan) i mamy tylko fallback slownikowy,
+            # NIE nadpisuj juz zapisanych, dobrych danych (kategoria/priorytet/odpowiedzi) pustymi wartosciami.
+            if classification.get("_source") == "keywords":
+                skipped += 1
+                errors.append(f"{str(em.get('subject',''))[:40]}: AI niedostepne, pominieto (dane bez zmian)")
+                continue
             patch = {
                 "category":      classification.get("category", em.get("category", "inne")),
                 "priority":      classification.get("priority", "moze_poczekac"),
@@ -353,7 +359,9 @@ async def reclassify_emails(client_email: str):
                 errors.append(f"{str(em.get('subject',''))[:40]}: {r.status_code}")
         except Exception as e:
             errors.append(f"{str(em.get('subject',''))[:40]}: {e}")
-    return {"success": True, "updated": updated, "total": len(emails), "errors": errors}
+        if i < len(emails) - 1:
+            await asyncio.sleep(1.5)  # odstep miedzy mailami — nie odpalaj limitu zapytan na minute
+    return {"success": True, "updated": updated, "skipped": skipped, "total": len(emails), "errors": errors}
 
 @app.delete("/api/emails/delete/{email_id}")
 async def delete_email(email_id: str):
@@ -551,16 +559,28 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         'Styl: formalny, profesjonalny, po polsku.\n'
         f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body[:600]}'
     )
-    try:
-        r = claude.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}])
-        raw = r.content[0].text.replace("```json","").replace("```","").strip()
-        result = json.loads(raw)
-    except Exception as e:
-        print(f"[AI] Blad klasyfikacji: {e}")
-        return _classify_by_keywords(subject, sender, has_pdf, body)
+    result = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = claude.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}])
+            raw = r.content[0].text.replace("```json","").replace("```","").strip()
+            result = json.loads(raw)
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[AI] Proba {attempt+1}/3 nieudana: {e}")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))  # odczekaj przed kolejna proba (np. rate limit)
+
+    if result is None:
+        print(f"[AI] Blad klasyfikacji po 3 probach: {last_err}")
+        fallback = _classify_by_keywords(subject, sender, has_pdf, body)
+        fallback["_source"] = "keywords"  # sygnalizuje ze to NIE jest wynik AI (uzyte np. przy reklasyfikacji, zeby nie nadpisywac dobrych danych)
+        return fallback
 
     category = result.get("category")
     if category in REPLY_CATEGORIES:
@@ -572,6 +592,7 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         if not reject or reject == approve:
             filled = _fill_missing_reply(claude, category, "reject", subject, sender, body)
             if filled: result["reply_reject"] = filled
+    result["_source"] = "ai"
     return result
 
 _REPLY_HINTS = {
