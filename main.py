@@ -541,10 +541,53 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
             max_tokens=900,
             messages=[{"role": "user", "content": prompt}])
         raw = r.content[0].text.replace("```json","").replace("```","").strip()
-        return json.loads(raw)
+        result = json.loads(raw)
     except Exception as e:
         print(f"[AI] Blad klasyfikacji: {e}")
         return _classify_by_keywords(subject, sender, has_pdf, body)
+
+    category = result.get("category")
+    if category in REPLY_CATEGORIES:
+        approve = (result.get("reply_approve") or "").strip()
+        reject  = (result.get("reply_reject") or "").strip()
+        if not approve:
+            filled = _fill_missing_reply(claude, category, "approve", subject, sender, body)
+            if filled: result["reply_approve"] = filled; approve = filled
+        if not reject or reject == approve:
+            filled = _fill_missing_reply(claude, category, "reject", subject, sender, body)
+            if filled: result["reply_reject"] = filled
+    return result
+
+_REPLY_HINTS = {
+    "zapytanie":  {"approve": "TAK, mamy dostepnosc/oferte — podaj cene/termin/warunki",
+                   "reject":  "NIESTETY nie mamy tego w ofercie / brak dostepnosci, nie mozemy zrealizowac tego zapytania"},
+    "zamowienie": {"approve": "potwierdzamy przyjecie zamowienia do realizacji",
+                   "reject":  "NIESTETY nie mozemy zrealizowac zamowienia (np. brak towaru)"},
+    "reklamacja": {"approve": "uznajemy reklamacje — opisz dalsze kroki",
+                   "reject":  "odrzucamy reklamacje, z uzasadnieniem"},
+    "faktura":    {"approve": "potwierdzamy przyjecie faktury do zaplaty",
+                   "reject":  "kwestionujemy fakture (niezgodnosc/blad) i prosimy o korekte"},
+}
+
+def _fill_missing_reply(claude, category: str, kind: str, subject, sender, body) -> Optional[str]:
+    """Dogenerowuje brakujaca (approve lub reject) wersje odpowiedzi osobnym, ukierunkowanym zapytaniem —
+    gwarantuje wynik niezaleznie od tego, czy glowna klasyfikacja sie do tego zastosowala."""
+    hint = _REPLY_HINTS.get(category, {}).get(kind, "")
+    prompt = (
+        'Napisz WYŁĄCZNIE pełną, formalną odpowiedź email po polsku (z powitaniem i pożegnaniem), '
+        'bez żadnych dodatkowych komentarzy, cudzysłowów ani JSON — sam tekst odpowiedzi.\n'
+        f'Odpowiedź ma być w tonie: {hint}.\n'
+        f'Od: {sender[:80]} | Temat: {subject[:120]} | Treść: {body[:600]}'
+    )
+    try:
+        r = claude.messages.create(
+            model="claude-haiku-4-5", max_tokens=500,
+            messages=[{"role": "user", "content": prompt}])
+        text = r.content[0].text.strip()
+        return text or None
+    except Exception as e:
+        print(f"[AI] Blad dogenerowania odpowiedzi ({kind}): {e}")
+        return None
 
 def _strip_diacritics(text: str) -> str:
     """Zamienia polskie znaki na ich odpowiedniki ASCII, żeby dopasowanie słów kluczowych działało niezależnie od diakrytyków."""
