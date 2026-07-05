@@ -444,6 +444,62 @@ SMTP_PRESETS = {
     "poczta.interia.pl":          ("poczta.interia.pl", 587),
 }
 
+class AttachmentRequest(BaseModel):
+    imap: ImapConfig
+    message_id: str
+
+@app.post("/api/emails/attachments")
+async def get_attachments(req: AttachmentRequest):
+    """Pobiera załączniki emaila z IMAP po message_id, zwraca jako base64."""
+    config = req.imap
+    try:
+        mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
+               else imaplib.IMAP4(config.host, config.port)
+        mail.login(config.username, config.password)
+        mail.select("INBOX")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
+
+    try:
+        # Szukaj po Message-ID
+        mid = req.message_id.strip()
+        _, data = mail.search(None, f'(HEADER "Message-ID" "{mid}")')
+        ids = data[0].split()
+        # Fallback — szukaj w całej skrzynce
+        if not ids:
+            _, data = mail.search(None, "ALL")
+            ids = data[0].split()[-500:]
+
+        attachments = []
+        for msg_id in ids:
+            _, msg_data = mail.fetch(msg_id, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            found_mid = _clean_message_id(msg.get("Message-ID", "") or "")
+            if found_mid and found_mid != mid:
+                continue
+            for part in msg.walk():
+                ct = part.get_content_type()
+                cd = part.get("Content-Disposition", "")
+                filename = part.get_filename()
+                if filename or "attachment" in cd:
+                    filename = _decode_hdr(filename or "plik")
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        attachments.append({
+                            "filename": filename,
+                            "content_type": ct,
+                            "data": base64.b64encode(payload).decode("utf-8"),
+                            "size": len(payload),
+                        })
+            if attachments:
+                break
+        mail.logout()
+        return {"success": True, "attachments": attachments}
+    except Exception as e:
+        try: mail.logout()
+        except: pass
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/emails/reply")
 async def send_reply(req: ReplyRequest):
     import smtplib
