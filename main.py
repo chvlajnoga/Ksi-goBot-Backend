@@ -3,6 +3,7 @@ KsięgoBot Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
 Pełna klasyfikacja emaili: faktury, zapytania, zamówienia, płatności
 """
 import imaplib, email, base64, os, json, re, time, asyncio
+from urllib.parse import quote
 from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional
@@ -37,22 +38,28 @@ async def sb_insert(table: str, data: dict):
     return r
 
 async def sb_select(table: str, filters: str = ""):
-    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}&order=created_at.desc"
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}&order=created_at.desc&limit=1000"
+    headers = {**sb_headers(), "Range-Unit": "items", "Range": "0-999"}
     async with httpx.AsyncClient() as c:
-        r = await c.get(url, headers=sb_headers(), timeout=10)
-    return r.json() if r.status_code == 200 else []
+        r = await c.get(url, headers=headers, timeout=15)
+    return r.json() if r.status_code in (200, 206) else []
 
-async def sb_exists(table: str, filters: str) -> bool:
-    """Sprawdza czy rekord już istnieje w bazie."""
-    url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}&limit=1"
+async def sb_exists(table: str, client_email: str, message_id: str) -> bool:
+    """Sprawdza czy rekord już istnieje w bazie — z poprawnym kodowaniem URL."""
+    params = {
+        "client_email": f"eq.{client_email}",
+        "message_id": f"eq.{message_id}",
+        "limit": "1",
+    }
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {**sb_headers(), "Prefer": "count=exact"}
     async with httpx.AsyncClient() as c:
-        r = await c.get(url, headers=headers, timeout=10)
+        r = await c.get(url, headers=headers, params=params, timeout=10)
     try:
         count = int(r.headers.get("content-range", "0/0").split("/")[-1])
         return count > 0
     except:
-        data = r.json()
+        data = r.json() if r.status_code == 200 else []
         return isinstance(data, list) and len(data) > 0
 
 async def sb_patch(table: str, filters: str, data: dict):
@@ -175,7 +182,7 @@ async def scan_mailbox(req: ScanRequest):
         since = since_dt.strftime("%d-%b-%Y")
         print(f"[SCAN] Skanowanie od: {since} (cofnięcie: {config.days_back} dni = {config.days_back*24:.1f}h)")
         _, ids_raw = mail.search(None, f'(SINCE "{since}")')
-        ids = ids_raw[0].split()[-300:]  # max 300 emaili
+        ids = ids_raw[0].split()[-300:][::-1]  # max 300, od najnowszych
         print(f"[SCAN] Emaili do analizy: {len(ids)}")
 
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -199,6 +206,13 @@ async def scan_mailbox(req: ScanRequest):
                     import hashlib
                     raw = f"{sender}{subject}{date}"
                     message_id = "hash-" + hashlib.md5(raw.encode()).hexdigest()
+
+                # SPRAWDŹ DUPLIKAT przed wywołaniem AI (oszczędność kosztów)
+                already_exists = await sb_exists("emails", config.username, message_id)
+                if already_exists:
+                    print(f"[SCAN] Pominięto duplikat: {subject[:50]}")
+                    skipped_duplicates += 1
+                    continue
 
                 print(f"[SCAN] Klasyfikuję: {subject[:60]} [{message_id[:30]}]")
                 sender_clean = sender[:200]
@@ -543,8 +557,7 @@ async def scan_follow_ups(req: FollowUpRequest):
                     message_id = "hash-" + hashlib.md5(f"{to_field}{subject}{date_str}".encode()).hexdigest()
 
                 # Sprawdź duplikat w follow_ups
-                exists = await sb_exists("follow_ups",
-                    f"client_email=eq.{config.username}&message_id=eq.{message_id}")
+                exists = await sb_exists("follow_ups", config.username, message_id)
                 if exists:
                     skipped += 1
                     continue
