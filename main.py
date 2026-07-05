@@ -201,16 +201,6 @@ async def scan_mailbox(req: ScanRequest):
                     message_id = "hash-" + hashlib.md5(raw.encode()).hexdigest()
 
                 print(f"[SCAN] Klasyfikuję: {subject[:60]} [{message_id[:30]}]")
-
-                # SPRAWDŹ DUPLIKAT po Message-ID
-                already_exists = await sb_exists(
-                    "emails",
-                    f"client_email=eq.{config.username}&message_id=eq.{message_id}"
-                )
-                if already_exists:
-                    print(f"[SCAN] Pominięto duplikat (Message-ID): {subject[:50]}")
-                    skipped_duplicates += 1
-                    continue
                 sender_clean = sender[:200]
 
                 # KLASYFIKACJA przez Claude
