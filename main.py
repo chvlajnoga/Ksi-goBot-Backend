@@ -485,6 +485,7 @@ async def scan_follow_ups(req: FollowUpRequest):
         raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
 
     sent_folder = None
+    # Najpierw próbuj znane nazwy
     for folder in SENT_FOLDERS:
         try:
             status, _ = mail.select(f'"{folder}"')
@@ -493,10 +494,27 @@ async def scan_follow_ups(req: FollowUpRequest):
                 break
         except: pass
 
+    # Fallback: przeszukaj wszystkie foldery i dopasuj po słowie kluczowym
+    if not sent_folder:
+        try:
+            _, folder_list = mail.list()
+            SENT_KEYWORDS = ["sent", "wysłane", "wyslan", "gesendet", "envoy", "inviati"]
+            for item in folder_list or []:
+                decoded = item.decode() if isinstance(item, bytes) else str(item)
+                name_part = decoded.split('"/"')[-1].strip().strip('"') if '"/"' in decoded else decoded.split()[-1].strip('"')
+                if any(k in name_part.lower() for k in SENT_KEYWORDS):
+                    try:
+                        status, _ = mail.select(f'"{name_part}"')
+                        if status == "OK":
+                            sent_folder = name_part
+                            break
+                    except: pass
+        except: pass
+
     if not sent_folder:
         try: mail.logout()
         except: pass
-        raise HTTPException(status_code=404, detail="Nie znaleziono folderu Wysłane")
+        raise HTTPException(status_code=404, detail="Nie znaleziono folderu Wysłane — sprawdź czy skrzynka ma folder Sent/Wysłane")
 
     try:
         cutoff = (datetime.now() - timedelta(days=req.days_without_reply)).strftime("%d-%b-%Y")
