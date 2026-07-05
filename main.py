@@ -175,7 +175,7 @@ async def scan_mailbox(req: ScanRequest):
         since = since_dt.strftime("%d-%b-%Y")
         print(f"[SCAN] Skanowanie od: {since} (cofnięcie: {config.days_back} dni = {config.days_back*24:.1f}h)")
         _, ids_raw = mail.search(None, f'(SINCE "{since}")')
-        ids = ids_raw[0].split()[-100:]  # max 100 emaili
+        ids = ids_raw[0].split()[-300:]  # max 300 emaili
         print(f"[SCAN] Emaili do analizy: {len(ids)}")
 
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
