@@ -100,6 +100,10 @@ class ReplyRequest(BaseModel):
     body: str
     in_reply_to: Optional[str] = ""
 
+class FollowUpRequest(BaseModel):
+    imap: ImapConfig
+    days_without_reply: int = 3
+
 # ── KATEGORIE EMAILI ──
 EMAIL_CATEGORIES = {
     "faktura":    {"label": "Faktura",    "color": "#c9a84c", "icon": "🧾"},
@@ -249,6 +253,22 @@ async def scan_mailbox(req: ScanRequest):
                     print(f"[SCAN] Nieoczekiwany blad zapisu emaila ({email_result.status_code}): {subject[:50]}")
                     errors.append(f"Email nie zapisany: {subject[:50]}")
                     continue
+
+                # Zapisz remindery wykryte przez AI
+                reminders_raw = classification.get("reminders") or []
+                if isinstance(reminders_raw, list):
+                    for rem in reminders_raw[:5]:
+                        if not isinstance(rem, dict): continue
+                        rem_date = _to_date(rem.get("date"))
+                        if not rem_date: continue
+                        await sb_insert("reminders", {
+                            "client_email":  config.username,
+                            "subject":       str(subject)[:500],
+                            "reminder_date": rem_date,
+                            "description":   str(rem.get("description", ""))[:500],
+                            "type":          str(rem.get("type", "inne"))[:50],
+                            "status":        "aktywny",
+                        })
 
                 # Jeśli to FAKTURA — analizuj głębiej
                 if category == "faktura" and atts:
@@ -446,6 +466,117 @@ async def send_reply(req: ReplyRequest):
         print(f"[SMTP] Błąd: {e}")
         raise HTTPException(status_code=500, detail=f"Błąd wysyłki: {str(e)}")
 
+@app.get("/api/follow-ups/{client_email:path}")
+async def get_follow_ups(client_email: str):
+    data = await sb_select("follow_ups", f"client_email=eq.{client_email}")
+    return {"success": True, "follow_ups": data, "count": len(data)}
+
+@app.post("/api/follow-ups/scan")
+async def scan_follow_ups(req: FollowUpRequest):
+    config = req.imap
+    found, skipped, errors = [], 0, []
+    SENT_FOLDERS = ["Sent", "Sent Items", "Sent Messages",
+                    "[Gmail]/Sent Mail", "INBOX.Sent", "Wysłane"]
+    try:
+        mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
+               else imaplib.IMAP4(config.host, config.port)
+        mail.login(config.username, config.password)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Błąd IMAP: {str(e)}")
+
+    sent_folder = None
+    for folder in SENT_FOLDERS:
+        try:
+            status, _ = mail.select(f'"{folder}"')
+            if status == "OK":
+                sent_folder = folder
+                break
+        except: pass
+
+    if not sent_folder:
+        try: mail.logout()
+        except: pass
+        raise HTTPException(status_code=404, detail="Nie znaleziono folderu Wysłane")
+
+    try:
+        cutoff = (datetime.now() - timedelta(days=req.days_without_reply)).strftime("%d-%b-%Y")
+        before  = (datetime.now() - timedelta(days=req.days_without_reply)).strftime("%d-%b-%Y")
+        _, ids_raw = mail.search(None, f'(BEFORE "{datetime.now().strftime("%d-%b-%Y")}" SINCE "{cutoff}")')
+        ids = ids_raw[0].split()[-50:]
+        print(f"[FOLLOWUP] Wysłanych do analizy: {len(ids)}")
+
+        for msg_id in ids:
+            try:
+                _, msg_data = mail.fetch(msg_id, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject    = _decode_hdr(msg.get("Subject", ""))
+                to_field   = msg.get("To", "")
+                date_str   = msg.get("Date", "")
+                message_id = _clean_message_id(msg.get("Message-ID", "") or "")
+                if not message_id:
+                    import hashlib
+                    message_id = "hash-" + hashlib.md5(f"{to_field}{subject}{date_str}".encode()).hexdigest()
+
+                # Sprawdź duplikat w follow_ups
+                exists = await sb_exists("follow_ups",
+                    f"client_email=eq.{config.username}&message_id=eq.{message_id}")
+                if exists:
+                    skipped += 1
+                    continue
+
+                # Sprawdź czy w INBOX jest odpowiedź (In-Reply-To lub References)
+                mail.select("INBOX")
+                _, reply_ids = mail.search(None, f'(OR HEADER "In-Reply-To" "{message_id}" HEADER "References" "{message_id}")')
+                has_reply = bool(reply_ids[0].split())
+                mail.select(f'"{sent_folder}"')
+
+                if not has_reply:
+                    sent_date = _to_date(date_str)
+                    record = {
+                        "client_email": config.username,
+                        "message_id":   message_id[:500],
+                        "subject":      str(subject)[:500],
+                        "sent_to":      str(to_field)[:255],
+                        "sent_at":      sent_date,
+                        "days_waiting": req.days_without_reply,
+                        "status":       "oczekuje",
+                    }
+                    r = await sb_insert("follow_ups", record)
+                    if r.status_code in (200, 201):
+                        found.append(record)
+                        print(f"[FOLLOWUP] Brak odpowiedzi: {subject[:50]}")
+            except Exception as e:
+                errors.append(str(e))
+
+        mail.logout()
+    except Exception as e:
+        try: mail.logout()
+        except: pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"success": True, "found": len(found), "skipped": skipped,
+            "errors": errors, "follow_ups": found}
+
+@app.patch("/api/follow-ups/{follow_up_id}")
+async def update_follow_up(follow_up_id: str, data: dict):
+    r = await sb_patch("follow_ups", f"id=eq.{follow_up_id}", data)
+    return {"success": r.status_code in (200, 204)}
+
+@app.delete("/api/follow-ups/{follow_up_id}")
+async def delete_follow_up(follow_up_id: str):
+    r = await sb_delete("follow_ups", f"id=eq.{follow_up_id}")
+    return {"success": r.status_code in (200, 204)}
+
+@app.get("/api/reminders/{client_email:path}")
+async def get_reminders(client_email: str):
+    data = await sb_select("reminders", f"client_email=eq.{client_email}&order=reminder_date.asc")
+    return {"success": True, "reminders": data, "count": len(data)}
+
+@app.delete("/api/reminders/{reminder_id}")
+async def delete_reminder(reminder_id: str):
+    r = await sb_delete("reminders", f"id=eq.{reminder_id}")
+    return {"success": r.status_code in (200, 204)}
+
 # ── HELPERS ──
 def _decode_hdr(val):
     try:
@@ -513,7 +644,9 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         '"priority":"pilne|wazne|moze_poczekac","summary":"max 1 zdanie po polsku",'
         '"action_needed":true/false,"action_desc":"co zrobic lub null",'
         '"reply_approve":"pelna formalna odpowiedz POZYTYWNA z powitaniem i pozegnaniem (null dla spam/inne)",'
-        '"reply_reject":"pelna formalna odpowiedz NEGATYWNA z powitaniem i pozegnaniem (null dla spam/inne)"}\n'
+        '"reply_reject":"pelna formalna odpowiedz NEGATYWNA z powitaniem i pozegnaniem (null dla spam/inne)",'
+        '"reminders":[{"date":"YYYY-MM-DD","description":"co zrobic","type":"platnosc|spotkanie|termin|inne"}]}\n'
+        'reminders: lista terminow/dat wykrytych w tresci emaila (np. termin platnosci, spotkanie, deadline). Pusta lista [] jesli brak.\n'
         '\n'
         'ZASADY ROZRÓŻNIANIA (najczęstsza pomyłka — czytaj uważnie):\n'
         '1) "zapytanie" — klient PYTA o cokolwiek związanego z transakcją, ZANIM doszło do złożenia zamówienia: '
