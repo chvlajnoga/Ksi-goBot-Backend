@@ -471,6 +471,23 @@ async def get_follow_ups(client_email: str):
     data = await sb_select("follow_ups", f"client_email=eq.{client_email}")
     return {"success": True, "follow_ups": data, "count": len(data)}
 
+@app.post("/api/imap/folders")
+async def list_imap_folders(req: FollowUpRequest):
+    config = req.imap
+    try:
+        mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
+               else imaplib.IMAP4(config.host, config.port)
+        mail.login(config.username, config.password)
+        _, folder_list = mail.list()
+        mail.logout()
+        folders = []
+        for item in folder_list or []:
+            decoded = item.decode(errors="replace") if isinstance(item, bytes) else str(item)
+            folders.append(decoded)
+        return {"folders": folders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/follow-ups/scan")
 async def scan_follow_ups(req: FollowUpRequest):
     config = req.imap
