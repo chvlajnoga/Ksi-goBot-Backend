@@ -190,12 +190,17 @@ async def scan_mailbox(req: ScanRequest):
 
         for msg_id in ids:
             try:
+                _, idate_data = mail.fetch(msg_id, "(INTERNALDATE)")
+                idate_raw = idate_data[0].decode() if idate_data and idate_data[0] else ""
+                m = re.search(r'INTERNALDATE "([^"]+)"', idate_raw)
+                internal_date = _to_date(m.group(1)) if m else None
+
                 _, msg_data = mail.fetch(msg_id, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
 
                 subject = _decode_hdr(msg.get("Subject", ""))
                 sender  = msg.get("From", "")
-                date    = msg.get("Date", "")
+                date    = internal_date or _to_date(msg.get("Date", ""))
                 body    = _get_body(msg)
                 atts    = _get_attachments(msg)
 
@@ -390,6 +395,11 @@ async def reclassify_emails(client_email: str):
 @app.delete("/api/emails/delete/{email_id}")
 async def delete_email(email_id: str):
     r = await sb_delete("emails", f"id=eq.{email_id}")
+    return {"success": r.status_code in (200, 204)}
+
+@app.patch("/api/emails/category/{email_id}")
+async def update_email_category(email_id: str, data: dict):
+    r = await sb_patch("emails", f"id=eq.{email_id}", {"category": data.get("category")})
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/invoices/{client_email:path}")
