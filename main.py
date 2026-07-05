@@ -492,7 +492,7 @@ async def list_imap_folders(req: FollowUpRequest):
 async def scan_follow_ups(req: FollowUpRequest):
     config = req.imap
     found, skipped, errors = [], 0, []
-    SENT_FOLDERS = ["Sent", "Sent Items", "Sent Messages",
+    SENT_FOLDERS = ["[Gmail]/Wys&AUI-ane", "Sent", "Sent Items", "Sent Messages",
                     "[Gmail]/Sent Mail", "INBOX.Sent", "Wysłane"]
     try:
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
