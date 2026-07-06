@@ -94,6 +94,7 @@ class ImapConfig(BaseModel):
 
 class ScanRequest(BaseModel):
     imap: ImapConfig
+    auto_save_documents: bool = False
 
 class ChatRequest(BaseModel):
     question: str
@@ -110,6 +111,9 @@ class ReplyRequest(BaseModel):
 class FollowUpRequest(BaseModel):
     imap: ImapConfig
     days_without_reply: int = 3
+
+# Maksymalny rozmiar pojedynczego zalacznika zapisywanego w bazie jako dokument
+DOCUMENT_MAX_SIZE = 15 * 1024 * 1024  # 15 MB
 
 # ── KATEGORIE EMAILI ──
 EMAIL_CATEGORIES = {
@@ -279,6 +283,29 @@ async def scan_mailbox(req: ScanRequest):
                             "status":        "aktywny",
                         })
 
+                # Zapisz automatycznie wszystkie zalaczniki (PDF/obrazy) jako dokumenty —
+                # tylko gdy uzytkownik wlaczyl przelacznik "Automatyczne pobieranie zalacznikow"
+                # w zakladce Harmonogram (auto_save_documents)
+                if req.auto_save_documents:
+                    for att in atts:
+                        if len(att["content"]) > DOCUMENT_MAX_SIZE:
+                            print(f"[SCAN] Pominięto dokument (za duży): {att['filename']}")
+                            continue
+                        doc_result = await sb_insert("documents", {
+                            "client_email": config.username,
+                            "message_id":   message_id[:500],
+                            "filename":     str(att["filename"])[:255],
+                            "content_type": att["content_type"],
+                            "data":         base64.b64encode(att["content"]).decode("utf-8"),
+                            "size":         len(att["content"]),
+                            "subject":      str(subject)[:500],
+                            "sender":       str(sender)[:255],
+                            "date":         _to_date(date),
+                            "category":     category,
+                        })
+                        if doc_result.status_code not in (200, 201):
+                            print(f"[SCAN] Dokument nie zapisany ({doc_result.status_code}): {att['filename']}")
+
                 # Jeśli to FAKTURA — analizuj głębiej
                 if category == "faktura" and atts:
                     for att in atts:
@@ -410,6 +437,38 @@ async def get_invoices(client_email: str):
 @app.delete("/api/invoices/{invoice_id}")
 async def delete_invoice(invoice_id: str):
     r = await sb_delete("invoices", f"id=eq.{invoice_id}")
+    return {"success": r.status_code in (200, 204)}
+
+class SaveDocumentRequest(BaseModel):
+    client_email: str
+    filename: str
+    content_type: str
+    data: str
+    size: int = 0
+    subject: Optional[str] = ""
+    sender: Optional[str] = ""
+
+@app.post("/api/documents/save")
+async def save_document(req: SaveDocumentRequest):
+    r = await sb_insert("documents", {
+        "client_email": req.client_email,
+        "filename":     req.filename[:255],
+        "content_type": req.content_type,
+        "data":         req.data,
+        "size":         req.size,
+        "subject":      (req.subject or "")[:500],
+        "sender":       (req.sender or "")[:255],
+    })
+    return {"success": r.status_code in (200, 201)}
+
+@app.get("/api/documents/{client_email:path}")
+async def get_documents(client_email: str):
+    data = await sb_select("documents", f"client_email=eq.{client_email}")
+    return {"success": True, "documents": data, "count": len(data)}
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str):
+    r = await sb_delete("documents", f"id=eq.{document_id}")
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/inquiries/{client_email:path}")
