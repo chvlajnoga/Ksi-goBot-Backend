@@ -8,9 +8,10 @@ from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional
 
-import anthropic, httpx
+import anthropic, httpx, resend
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="KsięgoBot API", version="3.0.0")
@@ -20,6 +21,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+resend.api_key  = RESEND_API_KEY
 
 # ── SUPABASE ──
 def sb_headers():
@@ -102,11 +105,12 @@ class ChatRequest(BaseModel):
     invoices: list = []
 
 class ReplyRequest(BaseModel):
-    imap: ImapConfig
+    imap: Optional[ImapConfig] = None
     to: str
     subject: str
     body: str
     in_reply_to: Optional[str] = ""
+    from_email: Optional[str] = ""
 
 class FollowUpRequest(BaseModel):
     imap: ImapConfig
@@ -502,14 +506,6 @@ async def chat(req: ChatRequest):
                    f"{ctx}\n\nPytanie: {req.question}"}])
     return {"success": True, "answer": r.content[0].text}
 
-SMTP_PRESETS = {
-    "imap.gmail.com":             ("smtp.gmail.com", 587),
-    "outlook.office365.com":      ("smtp.office365.com", 587),
-    "imap.wp.pl":                 ("smtp.wp.pl", 587),
-    "imap.poczta.onet.pl":        ("smtp.poczta.onet.pl", 465),
-    "poczta.interia.pl":          ("poczta.interia.pl", 587),
-}
-
 class AttachmentRequest(BaseModel):
     imap: ImapConfig
     message_id: str
@@ -568,39 +564,39 @@ async def get_attachments(req: AttachmentRequest):
 
 @app.post("/api/emails/reply")
 async def send_reply(req: ReplyRequest):
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+    """Wysyła odpowiedź przez Resend API (HTTP, port 443) zamiast surowego SMTP —
+    Render blokuje wychodzące polaczenia na portach SMTP (25/465/587) na darmowym planie."""
+    if not RESEND_API_KEY:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": "Brak RESEND_API_KEY — ustaw tę zmienną środowiskową na Render (klucz z resend.com).",
+        })
 
-    imap_host = req.imap.host.lower()
-    smtp_host, smtp_port = SMTP_PRESETS.get(imap_host, (imap_host.replace("imap.", "smtp."), 587))
+    sender = req.from_email.strip() if req.from_email else "KsięgoBot <onboarding@resend.dev>"
+    subject = req.subject if req.subject.startswith("Re:") else f"Re: {req.subject}"
 
-    msg = MIMEMultipart("alternative")
-    msg["From"]    = req.imap.username
-    msg["To"]      = req.to
-    msg["Subject"] = req.subject if req.subject.startswith("Re:") else f"Re: {req.subject}"
+    params = {
+        "from": sender,
+        "to": [req.to],
+        "subject": subject,
+        "text": req.body,
+    }
     if req.in_reply_to:
-        msg["In-Reply-To"] = req.in_reply_to
-        msg["References"]  = req.in_reply_to
-    msg.attach(MIMEText(req.body, "plain", "utf-8"))
+        mid = req.in_reply_to if req.in_reply_to.startswith("<") else f"<{req.in_reply_to}>"
+        params["headers"] = {"In-Reply-To": mid, "References": mid}
 
     try:
-        if smtp_port == 465:
-            import ssl
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=15) as s:
-                s.login(req.imap.username, req.imap.password)
-                s.sendmail(req.imap.username, req.to, msg.as_string())
-        else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
-                s.starttls()
-                s.login(req.imap.username, req.imap.password)
-                s.sendmail(req.imap.username, req.to, msg.as_string())
-        print(f"[SMTP] Wysłano odpowiedź do {req.to}")
-        return {"success": True, "message": f"Odpowiedź wysłana do {req.to}"}
+        result = resend.Emails.send(params)
+        email_id = result.get("id") if isinstance(result, dict) else None
+        print(f"[RESEND] Wysłano odpowiedź do {req.to} (id={email_id})")
+        return {"success": True, "message": f"Odpowiedź wysłana do {req.to}", "id": email_id}
     except Exception as e:
-        print(f"[SMTP] Błąd: {e}")
-        raise HTTPException(status_code=500, detail=f"Błąd wysyłki: {str(e)}")
+        print(f"[RESEND] Błąd: {e}")
+        return JSONResponse(status_code=502, content={
+            "success": False,
+            "error": str(e),
+            "detail": str(e),
+        })
 
 @app.get("/api/follow-ups/{client_email:path}")
 async def get_follow_ups(client_email: str):
