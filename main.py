@@ -2,7 +2,7 @@
 KsięgoBot Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
 Pełna klasyfikacja emaili: faktury, zapytania, zamówienia, płatności
 """
-import imaplib, email, base64, os, json, re, time, asyncio
+import imaplib, email, base64, os, json, re, time, asyncio, html
 from urllib.parse import quote
 from email.header import decode_header
 from datetime import datetime, timedelta
@@ -779,7 +779,10 @@ def _get_body(msg) -> str:
                 payload = part.get_payload(decode=True)
                 if payload:
                     raw = payload.decode("utf-8", errors="replace")
+                    # Usuń całe bloki <style>/<script> (razem z zawartością, np. regułami CSS)
+                    raw = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", " ", raw)
                     stripped = re.sub(r"<[^>]+>", " ", raw)
+                    stripped = html.unescape(stripped)
                     html_text = re.sub(r"\s+", " ", stripped).strip()
     except: pass
 
