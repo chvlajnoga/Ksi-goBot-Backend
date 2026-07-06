@@ -758,29 +758,34 @@ def _decode_hdr(val):
     except:
         return str(val)
 
+_HTML_STUB_HINTS = [
+    "nie obsluguje wiadomosci html", "nie obsluguje html", "przelacz klienta pocztowego",
+    "przelacz program pocztowy", "does not support html", "html mode",
+    "view this email in a web browser", "wyswietlic wiadomosc",
+]
+
 def _get_body(msg) -> str:
-    """Wyciąga tekst z emaila (plain text lub HTML)."""
-    body = ""
+    """Wyciąga tekst z emaila (plain text lub HTML). Jeśli część text/plain to tylko
+    placeholder ('Twój program pocztowy nie obsługuje HTML...'), parsuje zamiast tego część HTML."""
+    plain, html_text = "", ""
     try:
         for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/plain":
+            if part.get_content_type() == "text/plain" and not plain:
                 payload = part.get_payload(decode=True)
                 if payload:
-                    body += payload.decode("utf-8", errors="replace")[:10000]
-                    break
-        if not body:
-            for part in msg.walk():
-                ct = part.get_content_type()
-                if ct == "text/html":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        text = payload.decode("utf-8", errors="replace")
-                        # Usuń tagi HTML
-                        text = re.sub(r"<[^>]+>", " ", text)
-                        body = text[:10000]
-                        break
+                    plain = payload.decode("utf-8", errors="replace").strip()
+        for part in msg.walk():
+            if part.get_content_type() == "text/html" and not html_text:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    raw = payload.decode("utf-8", errors="replace")
+                    stripped = re.sub(r"<[^>]+>", " ", raw)
+                    html_text = re.sub(r"\s+", " ", stripped).strip()
     except: pass
+
+    plain_norm = _strip_diacritics(plain.lower())
+    is_stub = html_text and (len(plain) < 60 or any(h in plain_norm for h in _HTML_STUB_HINTS))
+    body = html_text if is_stub else (plain or html_text)
     return body[:10000]
 
 def _get_attachments(msg):
