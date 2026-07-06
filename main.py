@@ -111,6 +111,7 @@ class ReplyRequest(BaseModel):
     body: str
     in_reply_to: Optional[str] = ""
     from_email: Optional[str] = ""
+    reply_to: Optional[str] = ""
 
 class FollowUpRequest(BaseModel):
     imap: ImapConfig
@@ -572,7 +573,16 @@ async def send_reply(req: ReplyRequest):
             "error": "Brak RESEND_API_KEY — ustaw tę zmienną środowiskową na Render (klucz z resend.com).",
         })
 
-    sender = req.from_email.strip() if req.from_email else "KsięgoBot <onboarding@resend.dev>"
+    # Prawdziwa skrzynka klienta — nie mozemy wysylac "z" niej bezposrednio (Resend wymaga
+    # zweryfikowanej domeny, a domeny typu gmail.com/wp.pl nie da sie zweryfikowac dla cudzego konta),
+    # wiec ustawiamy ja jako Reply-To: odpowiedz odbiorcy trafi tam, gdzie normalnie by trafila.
+    client_mailbox = (req.reply_to or (req.imap.username if req.imap else "") or "").strip()
+
+    sender = req.from_email.strip() if req.from_email else ""
+    if not sender:
+        label = f"{client_mailbox} przez KsięgoBot" if client_mailbox else "KsięgoBot"
+        sender = f"{label} <onboarding@resend.dev>"
+
     subject = req.subject if req.subject.startswith("Re:") else f"Re: {req.subject}"
 
     params = {
@@ -581,6 +591,8 @@ async def send_reply(req: ReplyRequest):
         "subject": subject,
         "text": req.body,
     }
+    if client_mailbox:
+        params["reply_to"] = client_mailbox
     if req.in_reply_to:
         mid = req.in_reply_to if req.in_reply_to.startswith("<") else f"<{req.in_reply_to}>"
         params["headers"] = {"In-Reply-To": mid, "References": mid}
