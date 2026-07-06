@@ -241,7 +241,7 @@ async def scan_mailbox(req: ScanRequest):
                     "sender":         str(sender)[:255],
                     "subject":        str(subject)[:500],
                     "date":           _to_date(date),
-                    "body":           str(body)[:3000],
+                    "body":           str(body)[:10000],
                     "summary":        str(classification.get("summary", ""))[:1000],
                     "priority":       str(classification.get("priority", "moze_poczekac"))[:20],
                     "action_needed":  bool(classification.get("action_needed", False)),
@@ -269,11 +269,18 @@ async def scan_mailbox(req: ScanRequest):
 
                 # Zapisz remindery wykryte przez AI
                 reminders_raw = classification.get("reminders") or []
+                email_date_str = _to_date(date) or ""
                 if isinstance(reminders_raw, list):
                     for rem in reminders_raw[:5]:
                         if not isinstance(rem, dict): continue
                         rem_date = _to_date(rem.get("date"))
                         if not rem_date: continue
+                        # Zabezpieczenie przed halucynacja roku przez AI (np. 2024 zamiast 2026):
+                        # termin/deadline nie moze byc wczesniejszy niz sam email, w ktorym go znaleziono
+                        if email_date_str and rem_date[:10] < email_date_str[:10]:
+                            print(f"[SCAN] Pominieto reminder z nieprawdopodobna data z przeszlosci: "
+                                  f"{rem_date} (mail z {email_date_str[:10]}) — {subject[:50]}")
+                            continue
                         await sb_insert("reminders", {
                             "client_email":  config.username,
                             "subject":       str(subject)[:500],
@@ -760,7 +767,7 @@ def _get_body(msg) -> str:
             if ct == "text/plain":
                 payload = part.get_payload(decode=True)
                 if payload:
-                    body += payload.decode("utf-8", errors="replace")[:2000]
+                    body += payload.decode("utf-8", errors="replace")[:10000]
                     break
         if not body:
             for part in msg.walk():
@@ -771,10 +778,10 @@ def _get_body(msg) -> str:
                         text = payload.decode("utf-8", errors="replace")
                         # Usuń tagi HTML
                         text = re.sub(r"<[^>]+>", " ", text)
-                        body = text[:2000]
+                        body = text[:10000]
                         break
     except: pass
-    return body[:1500]
+    return body[:10000]
 
 def _get_attachments(msg):
     result = []
@@ -809,7 +816,10 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         '"reply_approve":"pelna formalna odpowiedz POZYTYWNA z powitaniem i pozegnaniem (null dla spam/inne)",'
         '"reply_reject":"pelna formalna odpowiedz NEGATYWNA z powitaniem i pozegnaniem (null dla spam/inne)",'
         '"reminders":[{"date":"YYYY-MM-DD","description":"co zrobic","type":"platnosc|spotkanie|termin|inne"}]}\n'
-        'reminders: lista terminow/dat wykrytych w tresci emaila (np. termin platnosci, spotkanie, deadline). Pusta lista [] jesli brak.\n'
+        'reminders: lista terminow/dat wykrytych w tresci emaila (np. termin platnosci, spotkanie, deadline, koniec przetargu). '
+        'Pusta lista [] jesli brak. KRYTYCZNE dla pola "date": przepisz rok DOKŁADNIE tak jak jest napisany w tresci maila — '
+        'nigdy nie zgaduj ani nie koryguj roku na podstawie własnych założeń o aktualnej dacie. '
+        'Sprawdz dwukrotnie cyfry roku (np. "19.09.2026" to rok 2026, nie 2024) zanim zwrocisz JSON.\n'
         '\n'
         'ZASADY ROZRÓŻNIANIA (najczęstsza pomyłka — czytaj uważnie):\n'
         '1) "zapytanie" — klient PYTA o cokolwiek związanego z transakcją, ZANIM doszło do złożenia zamówienia: '
@@ -871,7 +881,7 @@ def _classify_email(claude, subject, sender, body, atts, date) -> dict:
         '- "faktura": pozytywna = potwierdzamy przyjęcie faktury do zapłaty; '
         'negatywna = kwestionujemy fakturę (niezgodność/błąd), z prośbą o korektę.\n'
         'Styl: formalny, profesjonalny, po polsku.\n'
-        f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body[:600]}'
+        f'Od: {sender[:80]} | Temat: {subject[:120]} | PDF: {has_pdf} | Tresc: {body}'
     )
     result = None
     last_err = None
@@ -928,7 +938,7 @@ def _fill_missing_reply(claude, category: str, kind: str, subject, sender, body)
         'Napisz WYŁĄCZNIE pełną, formalną odpowiedź email po polsku (z powitaniem i pożegnaniem), '
         'bez żadnych dodatkowych komentarzy, cudzysłowów ani JSON — sam tekst odpowiedzi.\n'
         f'Odpowiedź ma być w tonie: {hint}.\n'
-        f'Od: {sender[:80]} | Temat: {subject[:120]} | Treść: {body[:600]}'
+        f'Od: {sender[:80]} | Temat: {subject[:120]} | Treść: {body}'
     )
     try:
         r = claude.messages.create(
