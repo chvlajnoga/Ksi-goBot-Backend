@@ -196,6 +196,7 @@ async def scan_mailbox(req: ScanRequest):
 
         claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         skipped_duplicates = 0
+        digest_emails = []
 
         for msg_id in ids:
             try:
@@ -271,6 +272,8 @@ async def scan_mailbox(req: ScanRequest):
                     print(f"[SCAN] Nieoczekiwany blad zapisu emaila ({email_result.status_code}): {subject[:50]}")
                     errors.append(f"Email nie zapisany: {subject[:50]}")
                     continue
+
+                digest_emails.append(email_record)
 
                 # Zapisz remindery wykryte przez AI
                 reminders_raw = classification.get("reminders") or []
@@ -363,6 +366,9 @@ async def scan_mailbox(req: ScanRequest):
                               f"Inne: {len(results['inne'])}"
         })
 
+        if digest_emails:
+            _send_daily_digest(config.username, digest_emails, results)
+
     except Exception as e:
         try: mail.logout()
         except: pass
@@ -439,6 +445,14 @@ async def delete_email(email_id: str):
 @app.patch("/api/emails/category/{email_id}")
 async def update_email_category(email_id: str, data: dict):
     r = await sb_patch("emails", f"id=eq.{email_id}", {"category": data.get("category")})
+    return {"success": r.status_code in (200, 204)}
+
+@app.patch("/api/emails/{email_id}/status")
+async def update_email_status(email_id: str, data: dict):
+    status = data.get("status")
+    if status not in ("nowe", "obsłużone"):
+        raise HTTPException(status_code=400, detail="status musi być 'nowe' lub 'obsłużone'")
+    r = await sb_patch("emails", f"id=eq.{email_id}", {"status": status})
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/invoices/{client_email:path}")
@@ -756,6 +770,46 @@ async def delete_reminder(reminder_id: str):
     return {"success": r.status_code in (200, 204)}
 
 # ── HELPERS ──
+CATEGORY_DIGEST_LABELS = {
+    "faktury": "faktur", "reklamacje": "reklamacji", "zapytania": "zapytań",
+    "zamowienia": "zamówień", "spam": "spam", "inne": "innych",
+}
+
+def _send_daily_digest(client_email: str, digest_emails: list, results: dict):
+    """Wysyła krótkie podsumowanie HTML po skanowaniu przez Resend — tylko gdy są nowe emaile."""
+    if not RESEND_API_KEY:
+        print("[DIGEST] Brak RESEND_API_KEY — pomijam wysyłkę digestu")
+        return
+    total = len(digest_emails)
+    cat_rows = "".join(
+        f"<li>{len(v)} {CATEGORY_DIGEST_LABELS.get(k, k)}</li>"
+        for k, v in results.items() if len(v) > 0
+    )
+    urgent = [e for e in digest_emails if e.get("action_needed")]
+    urgent_rows = "".join(
+        f"<li><b>{html.escape(str(e.get('subject') or ''))[:120]}</b>"
+        f"{' — ' + html.escape(str(e.get('action_desc') or ''))[:200] if e.get('action_desc') else ''}</li>"
+        for e in urgent[:20]
+    )
+    body_html = (
+        '<div style="font-family:Arial,sans-serif;max-width:600px">'
+        '<h2>KsięgoBot — podsumowanie skanowania</h2>'
+        f"<p>Znaleziono <b>{total}</b> nowych emaili:</p>"
+        f"<ul>{cat_rows}</ul>"
+        + (f"<p><b>Wymagają pilnej odpowiedzi:</b></p><ul>{urgent_rows}</ul>" if urgent_rows else "")
+        + "</div>"
+    )
+    try:
+        resend.Emails.send({
+            "from": "KsięgoBot <onboarding@resend.dev>",
+            "to": [client_email],
+            "subject": f"KsięgoBot: {total} nowych emaili na skrzynce",
+            "html": body_html,
+        })
+        print(f"[DIGEST] Wysłano digest do {client_email} ({total} nowych)")
+    except Exception as e:
+        print(f"[DIGEST] Błąd wysyłki digestu: {e}")
+
 def _decode_hdr(val):
     try:
         parts = decode_header(val)
