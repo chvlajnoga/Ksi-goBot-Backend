@@ -13,6 +13,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from cryptography import x509
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
 
 app = FastAPI(title="KsięgoBot API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -23,6 +27,20 @@ SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
 resend.api_key  = RESEND_API_KEY
+
+# Klucz do szyfrowania tokenow KSeF klientow zanim trafia do Supabase (Fernet, symetryczny).
+# Wygeneruj lokalnie: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# i ustaw jako zmienna srodowiskowa KSEF_ENCRYPTION_KEY na Render.
+KSEF_ENCRYPTION_KEY = os.environ.get("KSEF_ENCRYPTION_KEY", "")
+_ksef_fernet = Fernet(KSEF_ENCRYPTION_KEY.encode()) if KSEF_ENCRYPTION_KEY else None
+
+# Potwierdzone w oficjalnej dokumentacji CIRFMF/ksef-api (github.com/CIRFMF/ksef-api).
+# Adres produkcyjny wywnioskowany przez analogie do testowego (ten sam wzorzec domeny) —
+# zweryfikuj przed pierwszym uzyciem env="prod".
+KSEF_BASE_URLS = {
+    "test": "https://api-test.ksef.mf.gov.pl/v2",
+    "prod": "https://api.ksef.mf.gov.pl/v2",
+}
 
 # ── SUPABASE ──
 def sb_headers():
@@ -116,6 +134,12 @@ class ReplyRequest(BaseModel):
 class FollowUpRequest(BaseModel):
     imap: ImapConfig
     days_without_reply: int = 3
+
+class KsefConnectRequest(BaseModel):
+    client_email: str
+    nip: str
+    ksef_token: str
+    env: str = "test"
 
 # Maksymalny rozmiar pojedynczego zalacznika zapisywanego w bazie jako dokument
 DOCUMENT_MAX_SIZE = 15 * 1024 * 1024  # 15 MB
@@ -768,6 +792,227 @@ async def get_reminders(client_email: str):
 async def delete_reminder(reminder_id: str):
     r = await sb_delete("reminders", f"id=eq.{reminder_id}")
     return {"success": r.status_code in (200, 204)}
+
+# ── KSeF 2.0 (Etap 1: autoryzacja) ──
+# Zrodlo prawdy: github.com/CIRFMF/ksef-api (repo Ministerstwa Finansow).
+# Pelen flow autoryzacji tokenem KSeF ma 6 krokow — authenticationToken z /auth/ksef-token
+# NIE jest tokenem dostepowym, trzeba go "wymienic" (redeem) na accessToken.
+
+@app.post("/api/ksef/connect")
+async def ksef_connect(req: KsefConnectRequest):
+    env = req.env if req.env in KSEF_BASE_URLS else "test"
+    nip = re.sub(r"\D", "", req.nip)
+    if len(nip) != 10:
+        raise HTTPException(status_code=400, detail="NIP musi mieć dokładnie 10 cyfr")
+    if not req.ksef_token.strip():
+        raise HTTPException(status_code=400, detail="Brak tokenu KSeF")
+
+    try:
+        # Krok 1: klucz publiczny MF do szyfrowania tokenu
+        public_key = await _ksef_fetch_public_key(env)
+
+        # Krok 2: challenge + timestamp
+        challenge_data = await _ksef_get_challenge(env)
+        challenge = challenge_data.get("challenge")
+        timestamp_ms = challenge_data.get("timestamp", challenge_data.get("timestampMs"))
+        if not challenge or timestamp_ms is None:
+            raise HTTPException(status_code=502,
+                detail=f"KSeF: nieoczekiwana odpowiedź /auth/challenge: {challenge_data}")
+
+        # Krok 3: szyfrowanie "{token}|{timestamp}" RSA-OAEP/SHA-256
+        encrypted_token = _ksef_encrypt_token(public_key, req.ksef_token.strip(), timestamp_ms)
+
+        # Krok 4: wymiana challenge + zaszyfrowany token na authenticationToken (tymczasowy)
+        submit = await _ksef_submit_ksef_token(env, challenge, nip, encrypted_token)
+        auth_token = submit.get("authenticationToken")
+        reference_number = submit.get("referenceNumber")
+        if not auth_token or not reference_number:
+            raise HTTPException(status_code=502,
+                detail=f"KSeF: nieoczekiwana odpowiedź /auth/ksef-token: {submit}")
+
+        # Krok 5: czekaj aż autoryzacja się zakończy
+        await _ksef_wait_for_auth(env, reference_number, auth_token)
+
+        # Krok 6: wymień authenticationToken na docelowy accessToken + refreshToken
+        redeemed = await _ksef_redeem_access_token(env, auth_token)
+        access_token = _extract_jwt_value(redeemed.get("accessToken"))
+        refresh_token = _extract_jwt_value(redeemed.get("refreshToken"))
+        if not access_token:
+            raise HTTPException(status_code=502,
+                detail=f"KSeF: brak accessToken w odpowiedzi /auth/token/redeem: {redeemed}")
+
+        expires_at = _jwt_exp_iso(access_token)
+        encrypted_stored_token = _ksef_encrypt_for_storage(req.ksef_token.strip())
+
+        record = {
+            "client_email":         req.client_email,
+            "nip":                  nip,
+            "ksef_token_encrypted": encrypted_stored_token,
+            "auth_token":           access_token,
+            "refresh_token":        refresh_token,
+            "expires_at":           expires_at,
+            "env":                  env,
+            "status":               "active",
+        }
+        # Jedno aktywne polaczenie na klienta+srodowisko — usun poprzednie i zapisz nowe.
+        await sb_delete("ksef_connections", f"client_email=eq.{req.client_email}&env=eq.{env}")
+        r = await sb_insert("ksef_connections", record)
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502,
+                detail=f"Autoryzacja KSeF ok, ale zapis do bazy nie powiódł się ({r.status_code})")
+
+        return {"success": True, "message": f"Połączono z KSeF ({env})",
+                "env": env, "nip": nip, "expires_at": expires_at}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[KSEF] Błąd połączenia: {e}")
+        raise HTTPException(status_code=502, detail=f"Błąd integracji KSeF: {e}")
+
+@app.get("/api/ksef/status/{client_email:path}")
+async def ksef_status(client_email: str):
+    data = await sb_select("ksef_connections", f"client_email=eq.{client_email}")
+    if not data:
+        return {"success": True, "connected": False}
+    conn = data[0]  # sb_select sortuje po created_at desc — najnowsze polaczenie
+    return {
+        "success":   True,
+        "connected": conn.get("status") == "active",
+        "nip":       conn.get("nip"),
+        "env":       conn.get("env"),
+        "last_sync": conn.get("last_sync"),
+        "expires_at": conn.get("expires_at"),
+    }
+
+def _ksef_base_url(env: str) -> str:
+    return KSEF_BASE_URLS.get(env, KSEF_BASE_URLS["test"])
+
+async def _ksef_fetch_public_key(env: str):
+    """GET /security/public-key-certificates — zwraca klucz publiczny MF do szyfrowania tokenu KSeF."""
+    url = f"{_ksef_base_url(env)}/security/public-key-certificates"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502,
+            detail=f"KSeF: nie udało się pobrać klucza publicznego ({r.status_code}): {r.text[:300]}")
+    data = r.json()
+    entries = data if isinstance(data, list) else (data.get("certificates") or data.get("items") or [data])
+    cert_b64 = None
+    for entry in entries:
+        usage = entry.get("usage") or []
+        if isinstance(usage, str): usage = [usage]
+        if not cert_b64:
+            cert_b64 = entry.get("certificate")
+        if "KsefTokenEncryption" in usage:
+            cert_b64 = entry.get("certificate")
+            break
+    if not cert_b64:
+        raise HTTPException(status_code=502, detail="KSeF: brak certyfikatu w odpowiedzi /security/public-key-certificates")
+    cert = x509.load_der_x509_certificate(base64.b64decode(cert_b64))
+    return cert.public_key()
+
+async def _ksef_get_challenge(env: str) -> dict:
+    """POST /auth/challenge — challenge wazny 10 minut."""
+    url = f"{_ksef_base_url(env)}/auth/challenge"
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, timeout=15)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=502,
+            detail=f"KSeF: błąd pobierania challenge ({r.status_code}): {r.text[:300]}")
+    return r.json()
+
+def _ksef_encrypt_token(public_key, ksef_token: str, timestamp_ms) -> str:
+    """RSA-OAEP/SHA-256 nad '{token}|{timestampMs}', wynik base64 — zgodnie z dokumentacja CIRFMF."""
+    plaintext = f"{ksef_token}|{timestamp_ms}".encode("utf-8")
+    ciphertext = public_key.encrypt(
+        plaintext,
+        rsa_padding.OAEP(
+            mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return base64.b64encode(ciphertext).decode("utf-8")
+
+async def _ksef_submit_ksef_token(env: str, challenge: str, nip: str, encrypted_token: str) -> dict:
+    """POST /auth/ksef-token — zwraca authenticationToken (tymczasowy) + referenceNumber."""
+    url = f"{_ksef_base_url(env)}/auth/ksef-token"
+    body = {
+        "challenge": challenge,
+        "contextIdentifier": {"type": "nip", "value": nip},
+        "encryptedToken": encrypted_token,
+    }
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, json=body, timeout=15)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=401,
+            detail=f"KSeF: odrzucono token/autoryzację ({r.status_code}): {r.text[:300]}")
+    return r.json()
+
+async def _ksef_wait_for_auth(env: str, reference_number: str, auth_token: str):
+    """GET /auth/{referenceNumber} — polling do zakonczenia autoryzacji.
+    UWAGA: dokladna semantyka kodow statusu nie jest w pelni udokumentowana publicznie.
+    Zakladamy: code==200 -> sukces, code>=400 -> blad, inaczej -> w toku. Zweryfikuj przy
+    pierwszym realnym tescie (panel Swagger: api-test.ksef.mf.gov.pl/docs/v2) i dostosuj w razie potrzeby."""
+    url = f"{_ksef_base_url(env)}/auth/{reference_number}"
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    for attempt in range(10):
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            status_obj = data.get("status", data) if isinstance(data, dict) else {}
+            code = status_obj.get("code") if isinstance(status_obj, dict) else None
+            if code is None:
+                print(f"[KSEF] Nieznany kształt odpowiedzi statusu autoryzacji: {data}")
+                return data
+            if code == 200:
+                return data
+            if isinstance(code, int) and code >= 400:
+                raise HTTPException(status_code=401,
+                    detail=f"KSeF: autoryzacja odrzucona (status {code}): {status_obj.get('description','')}")
+            # w przeciwnym razie autoryzacja wciaz w toku — czekaj i sprobuj ponownie
+        await asyncio.sleep(1.5)
+    raise HTTPException(status_code=504, detail="KSeF: przekroczono czas oczekiwania na potwierdzenie autoryzacji")
+
+async def _ksef_redeem_access_token(env: str, auth_token: str) -> dict:
+    """POST /auth/token/redeem — wymienia authenticationToken na wlasciwy accessToken + refreshToken."""
+    url = f"{_ksef_base_url(env)}/auth/token/redeem"
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers, timeout=15)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=401,
+            detail=f"KSeF: nie udało się odebrać access tokena ({r.status_code}): {r.text[:300]}")
+    return r.json()
+
+def _extract_jwt_value(value) -> Optional[str]:
+    """accessToken/refreshToken bywaja zwracane jako plain string albo obiekt {token:...} — obsluz oba."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("token") or value.get("value") or value.get("accessToken")
+    return None
+
+def _jwt_exp_iso(token: str) -> Optional[str]:
+    """Odczytuje pole exp z JWT (bez weryfikacji podpisu — tylko do wyswietlenia daty wygasniecia)."""
+    try:
+        payload_b64 = token.split(".")[1]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        exp = payload.get("exp")
+        if exp:
+            return datetime.utcfromtimestamp(exp).isoformat()
+    except Exception:
+        pass
+    return None
+
+def _ksef_encrypt_for_storage(value: str) -> str:
+    if not _ksef_fernet:
+        raise HTTPException(status_code=500,
+            detail="Brak KSEF_ENCRYPTION_KEY na serwerze — ustaw tę zmienną środowiskową na Render przed podłączeniem KSeF.")
+    return _ksef_fernet.encrypt(value.encode("utf-8")).decode("utf-8")
 
 # ── HELPERS ──
 CATEGORY_DIGEST_LABELS = {
