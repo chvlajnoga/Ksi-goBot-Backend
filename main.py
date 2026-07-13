@@ -1,5 +1,5 @@
 ﻿"""
-KsięgoBot Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
+Syndris Backend v3.0 — FastAPI + IMAP + Claude AI + Supabase
 Pełna klasyfikacja emaili: faktury, zapytania, zamówienia, płatności
 """
 import imaplib, email, base64, os, json, re, time, asyncio, html
@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
 
-app = FastAPI(title="KsięgoBot API", version="3.0.0")
+app = FastAPI(title="Syndris API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -618,7 +618,7 @@ async def send_reply(req: ReplyRequest):
 
     sender = req.from_email.strip() if req.from_email else ""
     if not sender:
-        label = f"{client_mailbox} przez KsięgoBot" if client_mailbox else "KsięgoBot"
+        label = f"{client_mailbox} przez Syndris" if client_mailbox else "Syndris"
         sender = f"{label} <onboarding@resend.dev>"
 
     subject = req.subject if req.subject.startswith("Re:") else f"Re: {req.subject}"
@@ -1038,7 +1038,7 @@ def _send_daily_digest(client_email: str, digest_emails: list, results: dict):
     )
     body_html = (
         '<div style="font-family:Arial,sans-serif;max-width:600px">'
-        '<h2>KsięgoBot — podsumowanie skanowania</h2>'
+        '<h2>Syndris — podsumowanie skanowania</h2>'
         f"<p>Znaleziono <b>{total}</b> nowych emaili:</p>"
         f"<ul>{cat_rows}</ul>"
         + (f"<p><b>Wymagają pilnej odpowiedzi:</b></p><ul>{urgent_rows}</ul>" if urgent_rows else "")
@@ -1046,9 +1046,9 @@ def _send_daily_digest(client_email: str, digest_emails: list, results: dict):
     )
     try:
         resend.Emails.send({
-            "from": "KsięgoBot <onboarding@resend.dev>",
+            "from": "SyndrisAI <onboarding@resend.dev>",
             "to": [client_email],
-            "subject": f"KsięgoBot: {total} nowych emaili na skrzynce",
+            "subject": f"Syndris: {total} nowych emaili na skrzynce",
             "html": body_html,
         })
         print(f"[DIGEST] Wysłano digest do {client_email} ({total} nowych)")
