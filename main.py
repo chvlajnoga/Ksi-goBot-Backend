@@ -9,9 +9,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import anthropic, httpx, resend
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from cryptography import x509
 from cryptography.fernet import Fernet
@@ -27,6 +27,11 @@ SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
 resend.api_key  = RESEND_API_KEY
+
+# Klucz "anon"/publiczny z Supabase (Dashboard → Settings → API) — w odroznieniu od
+# SUPABASE_SECRET_KEY jest bezpieczny do ujawnienia w przegladarce klienta. Uzywany
+# tylko do przekierowania na hostowany OAuth Supabase (logowanie przez Microsoft/Azure).
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
 # Klucz do szyfrowania tokenow KSeF klientow zanim trafia do Supabase (Fernet, symetryczny).
 # Wygeneruj lokalnie: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -141,6 +146,18 @@ class KsefConnectRequest(BaseModel):
     ksef_token: str
     env: str = "test"
 
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    plan: str = "starter"
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class SyncUserRequest(BaseModel):
+    plan: str = "starter"
+
 # Maksymalny rozmiar pojedynczego zalacznika zapisywanego w bazie jako dokument
 DOCUMENT_MAX_SIZE = 15 * 1024 * 1024  # 15 MB
 
@@ -169,7 +186,8 @@ def health():
             "supabase": "ok" if SUPABASE_URL else "NOT SET"}
 
 @app.post("/api/imap/test")
-def test_imap(config: ImapConfig):
+async def test_imap(config: ImapConfig, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     try:
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
                else imaplib.IMAP4(config.host, config.port)
@@ -192,7 +210,8 @@ def test_imap(config: ImapConfig):
         raise HTTPException(status_code=500, detail=f"Błąd: {str(e)}")
 
 @app.post("/api/scan")
-async def scan_mailbox(req: ScanRequest):
+async def scan_mailbox(req: ScanRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     config = req.imap
     results = {"faktury": [], "reklamacje": [], "zapytania": [],
                "zamowienia": [], "spam": [], "inne": []}
@@ -422,9 +441,10 @@ async def get_emails(client_email: str, category: str = ""):
     return {"success": True, "emails": data, "count": len(data)}
 
 @app.post("/api/emails/reclassify/{client_email:path}")
-async def reclassify_emails(client_email: str):
+async def reclassify_emails(client_email: str, authorization: Optional[str] = Header(None)):
     """Ponownie klasyfikuje juz zapisane maile (kategoria + priorytet) wg aktualnych zasad AI.
     Potrzebne bo /api/scan pomija juz zapisane maile jako duplikaty i nigdy ich nie przeklasyfikuje."""
+    await _verify_auth_token(authorization)
     claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     emails = await sb_select("emails", f"client_email=eq.{client_email}")
     updated, skipped, errors = 0, 0, []
@@ -499,7 +519,8 @@ class SaveDocumentRequest(BaseModel):
     sender: Optional[str] = ""
 
 @app.post("/api/documents/save")
-async def save_document(req: SaveDocumentRequest):
+async def save_document(req: SaveDocumentRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_insert("documents", {
         "client_email": req.client_email,
         "filename":     req.filename[:255],
@@ -527,7 +548,8 @@ async def get_inquiries(client_email: str):
     return {"success": True, "inquiries": data, "count": len(data)}
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     invoices = req.invoices
     if not invoices and req.client_email:
@@ -550,8 +572,9 @@ class AttachmentRequest(BaseModel):
     message_id: str
 
 @app.post("/api/emails/attachments")
-async def get_attachments(req: AttachmentRequest):
+async def get_attachments(req: AttachmentRequest, authorization: Optional[str] = Header(None)):
     """Pobiera załączniki emaila z IMAP po message_id, zwraca jako base64."""
+    await _verify_auth_token(authorization)
     config = req.imap
     try:
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
@@ -602,9 +625,10 @@ async def get_attachments(req: AttachmentRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/emails/reply")
-async def send_reply(req: ReplyRequest):
+async def send_reply(req: ReplyRequest, authorization: Optional[str] = Header(None)):
     """Wysyła odpowiedź przez Resend API (HTTP, port 443) zamiast surowego SMTP —
     Render blokuje wychodzące polaczenia na portach SMTP (25/465/587) na darmowym planie."""
+    await _verify_auth_token(authorization)
     if not RESEND_API_KEY:
         return JSONResponse(status_code=500, content={
             "success": False,
@@ -654,7 +678,8 @@ async def get_follow_ups(client_email: str):
     return {"success": True, "follow_ups": data, "count": len(data)}
 
 @app.post("/api/imap/folders")
-async def list_imap_folders(req: FollowUpRequest):
+async def list_imap_folders(req: FollowUpRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     config = req.imap
     try:
         mail = imaplib.IMAP4_SSL(config.host, config.port) if config.use_ssl \
@@ -671,7 +696,8 @@ async def list_imap_folders(req: FollowUpRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/follow-ups/scan")
-async def scan_follow_ups(req: FollowUpRequest):
+async def scan_follow_ups(req: FollowUpRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     config = req.imap
     found, skipped, errors = [], 0, []
     SENT_FOLDERS = ["[Gmail]/Wys&AUI-ane", "Sent", "Sent Items", "Sent Messages",
@@ -793,13 +819,131 @@ async def delete_reminder(reminder_id: str):
     r = await sb_delete("reminders", f"id=eq.{reminder_id}")
     return {"success": r.status_code in (200, 204)}
 
+# ── AUTH (Supabase Auth) ──
+
+async def _verify_auth_token(authorization: Optional[str]) -> dict:
+    """Wspolna weryfikacja tokenu Syndris (Supabase Auth) — uzywana na endpointach
+    ktore koszutuja (Claude/Resend) albo dotykaja danych logowania klienta (IMAP/KSeF)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Wymagane logowanie — brak tokenu autoryzacji")
+    token = authorization.split(" ", 1)[1]
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {"apikey": SUPABASE_SECRET, "Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy lub wygasły token — zaloguj się ponownie")
+    return r.json()
+
+@app.post("/api/auth/register")
+async def auth_register(req: RegisterRequest):
+    url = f"{SUPABASE_URL}/auth/v1/signup"
+    headers = {"apikey": SUPABASE_SECRET, "Content-Type": "application/json"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers,
+                          json={"email": req.email, "password": req.password}, timeout=15)
+    if r.status_code not in (200, 201):
+        try:
+            detail = r.json().get("msg") or r.json().get("error_description") or r.text[:300]
+        except Exception:
+            detail = r.text[:300]
+        raise HTTPException(status_code=400, detail=f"Rejestracja nieudana: {detail}")
+
+    data = r.json()
+    auth_user_id = data.get("id") or (data.get("user") or {}).get("id")
+    await sb_insert("users", {
+        "email":         req.email,
+        "auth_user_id":  auth_user_id,
+        "plan":          req.plan,
+        "status":        "trial",
+    })
+    needs_confirmation = not data.get("access_token")
+    return {
+        "success": True,
+        "message": "Sprawdź email, żeby potwierdzić konto." if needs_confirmation else "Konto utworzone.",
+        "access_token": data.get("access_token"),
+        "user_id": auth_user_id,
+    }
+
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest):
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+    headers = {"apikey": SUPABASE_SECRET, "Content-Type": "application/json"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers,
+                          json={"email": req.email, "password": req.password}, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy email lub hasło")
+    data = r.json()
+    return {
+        "success": True,
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "user": data.get("user"),
+    }
+
+@app.get("/api/auth/me")
+async def auth_me(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Brak tokenu autoryzacji")
+    token = authorization.split(" ", 1)[1]
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {"apikey": SUPABASE_SECRET, "Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy lub wygasły token")
+    return {"success": True, "user": r.json()}
+
+@app.get("/api/auth/oauth/{provider}")
+async def auth_oauth_redirect(provider: str, redirect_to: str = ""):
+    """Przekierowuje przegladarke klienta na hostowany OAuth Supabase (np. Azure/Microsoft).
+    Wymaga wlaczonego providera w Supabase Dashboard → Authentication → Providers,
+    oraz dodania adresu strony logowania do dozwolonych Redirect URLs."""
+    if provider not in ("azure", "google", "github"):
+        raise HTTPException(status_code=400, detail=f"Nieobsługiwany provider OAuth: {provider}")
+    if not SUPABASE_ANON_KEY:
+        raise HTTPException(status_code=500,
+            detail="Brak SUPABASE_ANON_KEY na serwerze — dodaj tę zmienną środowiskową na Render "
+                   "(wartość z Supabase → Settings → API → 'anon public' key).")
+    url = f"{SUPABASE_URL}/auth/v1/authorize?provider={provider}&apikey={SUPABASE_ANON_KEY}"
+    if redirect_to:
+        url += f"&redirect_to={quote(redirect_to, safe='')}"
+    return RedirectResponse(url)
+
+@app.post("/api/auth/sync")
+async def auth_sync(req: SyncUserRequest, authorization: Optional[str] = Header(None)):
+    """Wolane po kazdym logowaniu (haslo lub OAuth) — upewnia sie, ze istnieje rekord
+    w naszej tabeli users, nawet jesli konto powstalo przez OAuth (bez /api/auth/register)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Brak tokenu autoryzacji")
+    token = authorization.split(" ", 1)[1]
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {"apikey": SUPABASE_SECRET, "Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy lub wygasły token")
+    user = r.json()
+    email = user.get("email")
+    existing = await sb_select("users", f"email=eq.{email}")
+    if not existing:
+        await sb_insert("users", {
+            "email":        email,
+            "auth_user_id": user.get("id"),
+            "plan":         req.plan,
+            "status":       "trial",
+        })
+    return {"success": True, "user": user}
+
 # ── KSeF 2.0 (Etap 1: autoryzacja) ──
 # Zrodlo prawdy: github.com/CIRFMF/ksef-api (repo Ministerstwa Finansow).
 # Pelen flow autoryzacji tokenem KSeF ma 6 krokow — authenticationToken z /auth/ksef-token
 # NIE jest tokenem dostepowym, trzeba go "wymienic" (redeem) na accessToken.
 
 @app.post("/api/ksef/connect")
-async def ksef_connect(req: KsefConnectRequest):
+async def ksef_connect(req: KsefConnectRequest, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     env = req.env if req.env in KSEF_BASE_URLS else "test"
     nip = re.sub(r"\D", "", req.nip)
     if len(nip) != 10:
