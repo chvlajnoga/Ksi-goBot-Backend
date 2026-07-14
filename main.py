@@ -155,6 +155,9 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
 class SyncUserRequest(BaseModel):
     plan: str = "starter"
 
@@ -433,7 +436,8 @@ async def scan_mailbox(req: ScanRequest, authorization: Optional[str] = Header(N
     }
 
 @app.get("/api/emails/{client_email:path}")
-async def get_emails(client_email: str, category: str = ""):
+async def get_emails(client_email: str, category: str = "", authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     filters = f"client_email=eq.{client_email}"
     if category:
         filters += f"&category=eq.{category}"
@@ -482,17 +486,20 @@ async def reclassify_emails(client_email: str, authorization: Optional[str] = He
     return {"success": True, "updated": updated, "skipped": skipped, "total": len(emails), "errors": errors}
 
 @app.delete("/api/emails/delete/{email_id}")
-async def delete_email(email_id: str):
+async def delete_email(email_id: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_delete("emails", f"id=eq.{email_id}")
     return {"success": r.status_code in (200, 204)}
 
 @app.patch("/api/emails/category/{email_id}")
-async def update_email_category(email_id: str, data: dict):
+async def update_email_category(email_id: str, data: dict, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_patch("emails", f"id=eq.{email_id}", {"category": data.get("category")})
     return {"success": r.status_code in (200, 204)}
 
 @app.patch("/api/emails/{email_id}/status")
-async def update_email_status(email_id: str, data: dict):
+async def update_email_status(email_id: str, data: dict, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     status = data.get("status")
     if status not in ("nowe", "obsłużone"):
         raise HTTPException(status_code=400, detail="status musi być 'nowe' lub 'obsłużone'")
@@ -500,12 +507,14 @@ async def update_email_status(email_id: str, data: dict):
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/invoices/{client_email:path}")
-async def get_invoices(client_email: str):
+async def get_invoices(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("invoices", f"client_email=eq.{client_email}")
     return {"success": True, "invoices": data, "count": len(data)}
 
 @app.delete("/api/invoices/{invoice_id}")
-async def delete_invoice(invoice_id: str):
+async def delete_invoice(invoice_id: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_delete("invoices", f"id=eq.{invoice_id}")
     return {"success": r.status_code in (200, 204)}
 
@@ -533,17 +542,20 @@ async def save_document(req: SaveDocumentRequest, authorization: Optional[str] =
     return {"success": r.status_code in (200, 201)}
 
 @app.get("/api/documents/{client_email:path}")
-async def get_documents(client_email: str):
+async def get_documents(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("documents", f"client_email=eq.{client_email}")
     return {"success": True, "documents": data, "count": len(data)}
 
 @app.delete("/api/documents/{document_id}")
-async def delete_document(document_id: str):
+async def delete_document(document_id: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_delete("documents", f"id=eq.{document_id}")
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/inquiries/{client_email:path}")
-async def get_inquiries(client_email: str):
+async def get_inquiries(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("inquiries", f"client_email=eq.{client_email}")
     return {"success": True, "inquiries": data, "count": len(data)}
 
@@ -673,7 +685,8 @@ async def send_reply(req: ReplyRequest, authorization: Optional[str] = Header(No
         })
 
 @app.get("/api/follow-ups/{client_email:path}")
-async def get_follow_ups(client_email: str):
+async def get_follow_ups(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("follow_ups", f"client_email=eq.{client_email}")
     return {"success": True, "follow_ups": data, "count": len(data)}
 
@@ -800,22 +813,26 @@ async def scan_follow_ups(req: FollowUpRequest, authorization: Optional[str] = H
             "errors": errors, "follow_ups": found}
 
 @app.patch("/api/follow-ups/{follow_up_id}")
-async def update_follow_up(follow_up_id: str, data: dict):
+async def update_follow_up(follow_up_id: str, data: dict, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_patch("follow_ups", f"id=eq.{follow_up_id}", data)
     return {"success": r.status_code in (200, 204)}
 
 @app.delete("/api/follow-ups/{follow_up_id}")
-async def delete_follow_up(follow_up_id: str):
+async def delete_follow_up(follow_up_id: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_delete("follow_ups", f"id=eq.{follow_up_id}")
     return {"success": r.status_code in (200, 204)}
 
 @app.get("/api/reminders/{client_email:path}")
-async def get_reminders(client_email: str):
+async def get_reminders(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("reminders", f"client_email=eq.{client_email}&order=reminder_date.asc")
     return {"success": True, "reminders": data, "count": len(data)}
 
 @app.delete("/api/reminders/{reminder_id}")
-async def delete_reminder(reminder_id: str):
+async def delete_reminder(reminder_id: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     r = await sb_delete("reminders", f"id=eq.{reminder_id}")
     return {"success": r.status_code in (200, 204)}
 
@@ -862,6 +879,7 @@ async def auth_register(req: RegisterRequest):
         "success": True,
         "message": "Sprawdź email, żeby potwierdzić konto." if needs_confirmation else "Konto utworzone.",
         "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
         "user_id": auth_user_id,
     }
 
@@ -880,6 +898,24 @@ async def auth_login(req: LoginRequest):
         "access_token": data.get("access_token"),
         "refresh_token": data.get("refresh_token"),
         "user": data.get("user"),
+    }
+
+@app.post("/api/auth/refresh")
+async def auth_refresh(req: RefreshRequest):
+    """Wymienia refresh_token na nowy access_token — pozwala sesji przetrwac dluzej
+    niz czas zycia access_token (zwykle ~1h) bez ponownego logowania hasłem."""
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
+    headers = {"apikey": SUPABASE_SECRET, "Content-Type": "application/json"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers,
+                          json={"refresh_token": req.refresh_token}, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Nie udało się odświeżyć sesji — zaloguj się ponownie")
+    data = r.json()
+    return {
+        "success": True,
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
     }
 
 @app.get("/api/auth/me")
@@ -1015,7 +1051,8 @@ async def ksef_connect(req: KsefConnectRequest, authorization: Optional[str] = H
         raise HTTPException(status_code=502, detail=f"Błąd integracji KSeF: {e}")
 
 @app.get("/api/ksef/status/{client_email:path}")
-async def ksef_status(client_email: str):
+async def ksef_status(client_email: str, authorization: Optional[str] = Header(None)):
+    await _verify_auth_token(authorization)
     data = await sb_select("ksef_connections", f"client_email=eq.{client_email}")
     if not data:
         return {"success": True, "connected": False}
