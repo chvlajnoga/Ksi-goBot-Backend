@@ -158,6 +158,13 @@ class LoginRequest(BaseModel):
 class RefreshRequest(BaseModel):
     refresh_token: str
 
+class VerifyOtpRequest(BaseModel):
+    email: str
+    token: str
+
+class ResendOtpRequest(BaseModel):
+    email: str
+
 class SyncUserRequest(BaseModel):
     plan: str = "starter"
 
@@ -899,6 +906,39 @@ async def auth_login(req: LoginRequest):
         "refresh_token": data.get("refresh_token"),
         "user": data.get("user"),
     }
+
+@app.post("/api/auth/verify-otp")
+async def auth_verify_otp(req: VerifyOtpRequest):
+    """Sprawdza 6-cyfrowy kod wyslany na email po rejestracji (Supabase Auth OTP).
+    Sukces = konto potwierdzone, zwraca sesje (jak przy zwyklym logowaniu)."""
+    url = f"{SUPABASE_URL}/auth/v1/verify"
+    headers = {"apikey": SUPABASE_SECRET, "Content-Type": "application/json"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers,
+                          json={"type": "signup", "email": req.email, "token": req.token}, timeout=15)
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("msg") or r.json().get("error_description") or "Nieprawidłowy lub wygasły kod"
+        except Exception:
+            detail = "Nieprawidłowy lub wygasły kod"
+        raise HTTPException(status_code=400, detail=detail)
+    data = r.json()
+    return {
+        "success": True,
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+    }
+
+@app.post("/api/auth/resend-otp")
+async def auth_resend_otp(req: ResendOtpRequest):
+    url = f"{SUPABASE_URL}/auth/v1/resend"
+    headers = {"apikey": SUPABASE_SECRET, "Content-Type": "application/json"}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers,
+                          json={"type": "signup", "email": req.email}, timeout=15)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail="Nie udało się wysłać kodu ponownie")
+    return {"success": True}
 
 @app.post("/api/auth/refresh")
 async def auth_refresh(req: RefreshRequest):
